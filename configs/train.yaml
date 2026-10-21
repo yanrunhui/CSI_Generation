@@ -1,0 +1,23 @@
+train:
+  seed: 2026
+  device: auto
+  epochs: 500
+  batch_size: 256
+  num_workers: 4
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 5.0
+  mixed_precision: true
+  patience: 40
+  checkpoint_dir: artifacts/checkpoints
+  log_every_steps: 50
+  loss_weights:
+    path: 1.0
+    csi: 1.0
+    kl: 0.01
+    physics: 0.1
+    path_count: 0.2
+    validity: 0.2
+    direct_path: 0.1
+  kl_warmup_epochs: 50
+

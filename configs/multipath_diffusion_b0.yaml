@@ -1,0 +1,57 @@
+statistics_path: artifacts/statistics/diffusion_train.json
+statistics_batch_size: 512
+
+multipath_diffusion:
+  max_paths: 5
+  hidden_dim: 256
+  condition_embedding_dim: 128
+  layers: 4
+  attention_heads: 8
+  dropout: 0.05
+  diffusion_steps: 1000
+  cosine_offset: 0.008
+  clip_denoised: 5.0
+  condition_dropout: 0.10
+  path_count_loss_weight: 1.0
+  path_count:
+    class_weight_power: 0.0
+    max_weight_ratio: 1.0
+    prior_correction: false
+    label_smoothing: 0.0
+  parameterization:
+    mode: legacy_projection
+    structured_delay: false
+    structured_power: false
+    structured_k_factor: false
+    epsilon: 1.0e-20
+  constraints:
+    enforce_total_power: true
+    enforce_delay_spread: true
+    enforce_k_factor: true
+    enforce_los_direct_path: true
+    epsilon: 1.0e-20
+
+sampling:
+  sampler: ddim
+  sampling_steps: 100
+  eta: 0.0
+  guidance_scale: 1.0
+  path_count_temperature: 1.0
+
+train:
+  seed: 2026
+  device: auto
+  epochs: 200
+  batch_size: 256
+  num_workers: 4
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  mixed_precision: false
+  amp_initial_scale: 4096
+  ema_decay: 0.999
+  patience: 40
+  lr_patience: 10
+  lr_reduce_factor: 0.5
+  checkpoint_dir: artifacts/checkpoints/multipath_diffusion_b0
+  log_every_steps: 20

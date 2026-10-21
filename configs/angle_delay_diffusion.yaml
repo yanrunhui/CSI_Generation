@@ -1,0 +1,39 @@
+statistics_path: artifacts/statistics/diffusion_train.json
+statistics_batch_size: 512
+
+angle_delay_diffusion:
+  channels: 48
+  layers: 6
+  condition_embedding_dim: 128
+  condition_hidden_dim: 192
+  dropout: 0.05
+  diffusion_steps: 1000
+  cosine_offset: 0.008
+  clip_denoised: 5.0
+  condition_dropout: 0.10
+
+sampling:
+  sampler: ddim
+  sampling_steps: 100
+  eta: 0.0
+  guidance_scale: 1.5
+  calibration: none  # none | csi_energy_proxy (proxy only; not path K/LoS calibration)
+
+train:
+  seed: 2026
+  device: auto
+  epochs: 200
+  batch_size: 32
+  num_workers: 4
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  mixed_precision: true
+  amp_initial_scale: 4096
+  ema_decay: 0.999
+  patience: 40
+  lr_patience: 10
+  lr_reduce_factor: 0.5
+  checkpoint_dir: artifacts/checkpoints/angle_delay_diffusion
+  log_every_steps: 20
+

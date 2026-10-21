@@ -1,0 +1,41 @@
+data:
+  raw_root: /Users/yanrunhui/CSI_model/deepmimo_scenarios/D2Los_Data
+  prepared_root: artifacts/prepared_d2los
+  file_pattern: "map_*/special_points_propbin_*/source_*.propbin*"
+  max_paths: 5
+  overflow_policy: error       # error | strongest
+  shard_size: 2048
+  max_samples: 100000
+  max_sources_per_map: null
+  max_receivers_per_source: 32
+  sampling: map_uniform        # sequential | uniform | map_uniform
+  seed: 2026
+  split:
+    mode: cross_map            # cross_map | single_map
+    train_ratio: 0.70
+    validation_ratio: 0.10
+    test_ratio: 0.20
+    single_map_id: 0
+    spatial_tile_size_m: 16.0
+  path_power:
+    definition: dimensionless_path_gain
+    formula: "10 ** (-path_loss_db / 10)"
+  phase:
+    source: propagation_distance
+    formula: "wrap(-2*pi*carrier_hz*distance_m/c)"
+  k_factor:
+    policy: los_direct_to_remaining
+    invalid_fill_db: 0.0
+  system:
+    carrier_hz: 3.5e9
+    bandwidth_hz: 100.0e6
+    num_subcarriers: 64
+    tx_array_shape: [8, 8]
+    rx_array_shape: [1, 1]
+    tx_array_plane: xy
+    rx_array_plane: xy
+    tx_spacing_wavelengths: 0.5
+    rx_spacing_wavelengths: 0.5
+    center_subcarriers: true
+    normalize_array_response: true
+

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "physics-controllable-csi"
+version = "0.1.0"
+description = "Physics-conditioned CVAE and dual diffusion models for controllable MIMO-OFDM CSI generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD-3-Clause"}
+dependencies = [
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+  "torch>=2.4",
+]
+
+[project.optional-dependencies]
+evaluation = ["scipy>=1.10", "matplotlib>=3.7"]
+test = ["pytest>=8.0"]
+pgc = ["matplotlib>=3.7", "opt-einsum>=3.4", "torchinfo>=1.8", "torchvision"]
+
+[tool.setuptools.packages.find]
+include = ["physics_csi*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

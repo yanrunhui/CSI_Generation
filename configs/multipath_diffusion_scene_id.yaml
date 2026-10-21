@@ -1,0 +1,65 @@
+statistics_path: artifacts/statistics/diffusion_seen_map_scene_id.json
+statistics_batch_size: 512
+
+multipath_diffusion:
+  max_paths: 5
+  hidden_dim: 256
+  condition_embedding_dim: 128
+  layers: 4
+  attention_heads: 8
+  dropout: 0.05
+  diffusion_steps: 1000
+  cosine_offset: 0.008
+  clip_denoised: 5.0
+  condition_dropout: 0.10
+  path_count_loss_weight: 1.0
+  scene_conditioning:
+    enabled: true
+    embedding_dim: 32
+    fusion_hidden_dim: 256
+    dropout: 0.05
+    # Injected from --scene-plan. Never assign indices from raw numeric Map IDs.
+    map_id_to_index: {}
+  path_count:
+    class_weight_power: 0.5
+    max_weight_ratio: 4.0
+    prior_correction: true
+    label_smoothing: 0.01
+  parameterization:
+    mode: structured
+    structured_delay: true
+    structured_power: true
+    structured_k_factor: true
+    epsilon: 1.0e-20
+  constraints:
+    enforce_total_power: true
+    enforce_delay_spread: true
+    enforce_k_factor: true
+    enforce_los_direct_path: true
+    epsilon: 1.0e-20
+
+sampling:
+  sampler: ddim
+  sampling_steps: 100
+  eta: 0.0
+  guidance_scale: 1.0
+  path_count_temperature: 1.0
+
+train:
+  seed: 2026
+  device: auto
+  # Epoch 0..40 gives 41 passes, matching the completed B3 comparison budget.
+  epochs: 41
+  batch_size: 256
+  num_workers: 4
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  mixed_precision: false
+  amp_initial_scale: 4096
+  ema_decay: 0.999
+  patience: 40
+  lr_patience: 10
+  lr_reduce_factor: 0.5
+  checkpoint_dir: artifacts/checkpoints/b3_scene_id
+  log_every_steps: 20

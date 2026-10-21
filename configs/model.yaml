@@ -1,0 +1,27 @@
+model:
+  max_paths: 5
+  latent_dim: 32
+  hidden_dim: 256
+  condition_embedding_dim: 64
+  path_embedding_dim: 96
+  encoder_layers: 3
+  decoder_layers: 3
+  dropout: 0.05
+  condition_fields:
+    - total_power_db
+    - delay_spread_ns
+    - k_factor_db
+    - los_status
+  condition_normalization:
+    mean: [-90.0, 100.0, 5.0, 0.5]
+    std: [20.0, 100.0, 10.0, 0.5]
+  path_scales:
+    delay_ns: 1000.0
+    log_power_db: 20.0
+  constraints:
+    enforce_total_power: true
+    enforce_delay_spread: true
+    enforce_k_factor: true
+    enforce_los_direct_path: true
+    epsilon: 1.0e-20
+
