@@ -46,6 +46,14 @@ def _cpu(value: Any) -> Any:
     return value
 
 
+def _to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: _to_device(item, device) for key, item in value.items()}
+    return value
+
+
 def _reference(records: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     return {
         key: torch.stack([record[key] for record in records])
@@ -79,13 +87,13 @@ def _path_count_report(
     support = matrix.sum(1)
     recall = matrix.diag().float() / support.clamp_min(1)
     return {
-        "generated_histogram": generated_histogram.tolist(),
-        "reference_histogram": reference_histogram.tolist(),
+        "generated_histogram": generated_histogram.cpu().tolist(),
+        "reference_histogram": reference_histogram.cpu().tolist(),
         "total_variation_distance": float(
             0.5 * (generated_frequency - reference_frequency).abs().sum()
         ),
-        "confusion_matrix": matrix.tolist(),
-        "recall": recall.tolist(),
+        "confusion_matrix": matrix.cpu().tolist(),
+        "recall": recall.cpu().tolist(),
         "accuracy": float(matrix.diag().sum() / matrix.sum().clamp_min(1)),
         "balanced_accuracy": float(recall[support > 0].mean()),
     }
@@ -124,12 +132,30 @@ def _generate(
     sampling: dict[str, Any],
     seed: int,
     device: torch.device,
+    output_device: torch.device,
+    label: str,
 ) -> dict[str, torch.Tensor]:
     generator = torch.Generator(device=device).manual_seed(seed)
     chunks: list[dict[str, torch.Tensor]] = []
     sample_count = reference["conditions"].shape[0]
+    batch_count = (sample_count + batch_size - 1) // batch_size
     for start in range(0, sample_count, batch_size):
         stop = min(start + batch_size, sample_count)
+        batch_index = start // batch_size + 1
+        print(
+            json.dumps(
+                {
+                    "event": "generation_progress",
+                    "label": label,
+                    "batch": batch_index,
+                    "batches": batch_count,
+                    "samples_complete": stop,
+                    "samples_total": sample_count,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         generated = model.generate(
             reference["conditions"][start:stop].to(device),
             stop - start,
@@ -142,7 +168,7 @@ def _generate(
             path_count_temperature=float(sampling["path_count_temperature"]),
             generator=generator,
         )
-        chunks.append(_cpu(generated))
+        chunks.append(_to_device(generated, output_device))
     return _concatenate(chunks)
 
 
@@ -182,12 +208,26 @@ def main() -> None:
     parser.add_argument("--guidance-scale", type=float, default=None)
     parser.add_argument("--path-count-temperature", type=float, default=None)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--metrics-device",
+        default="same",
+        choices=["same", "cpu", "cuda"],
+        help=(
+            "Device for MMD/Wasserstein/PDP/correlation metrics. 'same' uses the "
+            "generation device and is recommended for a GPU with sufficient memory."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--generated-output", default=None)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     device = resolve_device(args.device)
+    metrics_device = (
+        device if args.metrics_device == "same" else resolve_device(args.metrics_device)
+    )
+    if metrics_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--metrics-device cuda requested but CUDA is unavailable")
     scene_checkpoint = torch.load(
         args.scene_checkpoint, map_location="cpu", weights_only=False
     )
@@ -221,6 +261,20 @@ def main() -> None:
     reference = _reference(records)
     known_maps = sorted(int(value) for value in plan["map_id_to_index"])
     wrong_map_ids = _wrong_map_ids(reference["map_id"], known_maps)
+    reference = _to_device(reference, metrics_device)
+    wrong_map_ids = wrong_map_ids.to(metrics_device)
+    print(
+        json.dumps(
+            {
+                "event": "evaluation_started",
+                "samples": len(records),
+                "generation_device": str(device),
+                "metrics_device": str(metrics_device),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     sampling_config = scene_config["sampling"]
     sampling = {
         "sampler": args.sampler or sampling_config["sampler"],
@@ -257,6 +311,8 @@ def main() -> None:
         sampling=sampling,
         seed=args.seed,
         device=device,
+        output_device=metrics_device,
+        label="correct_map",
     )
     shuffled = _generate(
         scene_model,
@@ -266,6 +322,8 @@ def main() -> None:
         sampling=sampling,
         seed=args.seed,
         device=device,
+        output_device=metrics_device,
+        label="shuffled_map",
     )
     baseline = (
         _generate(
@@ -276,15 +334,25 @@ def main() -> None:
             sampling=baseline_sampling,
             seed=args.seed,
             device=device,
+            output_device=metrics_device,
+            label="physics_only_baseline",
         )
         if baseline_checkpoint is not None
         else None
     )
+    print(json.dumps({"event": "overall_metrics", "label": "correct_map"}), flush=True)
     overall = {
         "correct_map": _evaluate(correct, reference, scene_model.max_paths),
-        "shuffled_map": _evaluate(shuffled, reference, scene_model.max_paths),
     }
+    print(json.dumps({"event": "overall_metrics", "label": "shuffled_map"}), flush=True)
+    overall["shuffled_map"] = _evaluate(
+        shuffled, reference, scene_model.max_paths
+    )
     if baseline is not None:
+        print(
+            json.dumps({"event": "overall_metrics", "label": "physics_only_baseline"}),
+            flush=True,
+        )
         overall["physics_only_baseline"] = _evaluate(
             baseline, reference, scene_model.max_paths
         )
@@ -312,6 +380,17 @@ def main() -> None:
                 "status": "insufficient_reference_samples",
             }
             continue
+        print(
+            json.dumps(
+                {
+                    "event": "per_map_metrics",
+                    "map_id": map_id,
+                    "samples": sample_count,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         ref_map = _subset(reference, keep)
         correct_report = _evaluate(
             _subset(correct, keep), ref_map, scene_model.max_paths
@@ -360,6 +439,10 @@ def main() -> None:
         "scene_plan_fingerprint": plan["fingerprint"],
         "samples": len(records),
         "maps_with_metrics": evaluated_maps,
+        "devices": {
+            "generation": str(device),
+            "metrics": str(metrics_device),
+        },
         "sampling": {
             "scene_id": sampling,
             "physics_only_baseline": (
@@ -397,11 +480,11 @@ def main() -> None:
         torch.save(
             {
                 "format_version": 1,
-                "reference": reference,
-                "correct_map": correct,
-                "shuffled_map": shuffled,
-                "physics_only_baseline": baseline,
-                "wrong_map_id": wrong_map_ids,
+                "reference": _cpu(reference),
+                "correct_map": _cpu(correct),
+                "shuffled_map": _cpu(shuffled),
+                "physics_only_baseline": _cpu(baseline),
+                "wrong_map_id": wrong_map_ids.cpu(),
                 "scene_plan_fingerprint": plan["fingerprint"],
             },
             output,

@@ -98,18 +98,59 @@ Run the unified independent-test comparison:
 python scripts/evaluate_scene_id_protocol.py \
   --scene-checkpoint artifacts/checkpoints/b3_scene_id/best_calibrated.pt \
   --baseline-checkpoint artifacts/checkpoints/b3_seen_map_baseline/best.pt \
+  --metrics-device cuda \
   --max-samples 2048 \
   --output artifacts/reports/b3_scene_id_vs_b3.json \
   --generated-output artifacts/generated/b3_scene_id_evaluation.pt
 ```
 
 Audit whether Map ID is scientifically necessary after matching physical
-conditions (this operates only on real held-out data):
+conditions (this operates only on real held-out data). The report also compares
+cross-Map distances against condition-matched splits from within the same Map,
+which acts as a finite-sample null:
 
 ```bash
 python scripts/audit_scene_separation.py \
   --scene-plan artifacts/splits/scene_id_seen_map_v1.json \
+  --device cuda \
   --output artifacts/reports/real_map_separation.json
+```
+
+For the paper-level audit, use the strict protocol. It enforces one-to-one
+matching without replacement, exact LoS and K-validity matching, 20 repeated
+draws, Map-cluster bootstrap confidence intervals, coordinate/Tx-layout
+checks, and both global-coordinate and receiver-PCA-aligned spatial metrics:
+
+```bash
+python scripts/audit_scene_separation_strict.py \
+  --scene-plan artifacts/splits/scene_id_seen_map_v1.json \
+  --prepared-root artifacts/prepared_d2los \
+  --split test \
+  --maximum-condition-distance 1.0 \
+  --samples-per-comparison 64 \
+  --repeats 20 \
+  --maximum-map-pairs 100 \
+  --maximum-samples-per-map 256 \
+  --map-pair-selection random \
+  --cluster-bootstrap-samples 2000 \
+  --device cuda \
+  --seed 2026 \
+  --output artifacts/reports/real_map_scene_structure_strict.json
+```
+
+Rotation alignment is a coordinate-sensitivity analysis. The prepared records
+contain Tx/Rx positions but no per-transmitter antenna yaw/pitch/roll, so the
+report explicitly records that physical array orientation cannot be verified.
+
+After unified evaluation has saved generated tensors, diagnose whether the
+correct Map ID improves AoD direction, angular clustering, power-angle
+coupling, the full spatial correlation matrix, and normalized complex CSI:
+
+```bash
+python scripts/diagnose_scene_conditioning.py \
+  --generated artifacts/generated/b3_scene_id_evaluation.pt \
+  --device cuda \
+  --output artifacts/reports/b3_scene_id_structure_diagnostics.json
 ```
 
 The central claim is supported only when the correct Map ID is closer to that

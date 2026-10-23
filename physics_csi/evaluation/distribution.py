@@ -77,7 +77,12 @@ def _active_path_features(payload: dict[str, torch.Tensor]) -> torch.Tensor:
 
 def _correlation_matrix(values: torch.Tensor) -> torch.Tensor:
     if values.shape[0] < 2:
-        return torch.zeros(values.shape[-1], values.shape[-1])
+        return torch.zeros(
+            values.shape[-1],
+            values.shape[-1],
+            device=values.device,
+            dtype=values.dtype,
+        )
     standardized = (values - values.mean(0, keepdim=True)) / values.std(
         0, unbiased=False, keepdim=True
     ).clamp_min(1e-6)
