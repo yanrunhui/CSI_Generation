@@ -156,3 +156,53 @@ python scripts/diagnose_scene_conditioning.py \
 The central claim is supported only when the correct Map ID is closer to that
 map's held-out real distribution than both the shuffled Map ID and the matched
 physics-only baseline. Output change alone is not evidence of better fidelity.
+
+## Spatial-supervision and residual-adapter experiments
+
+Three follow-up configurations isolate the source of the B3-S-ID trade-off:
+
+- **E1** (`multipath_diffusion_e1_spatial.yaml`) keeps direct B3-S-ID and adds
+  paired Beamspace and complex Tx-covariance losses.
+- **S1** (`multipath_diffusion_s1_scene_residual.yaml`) freezes the matched B3
+  condition encoder, path-count model and denoiser, and learns only a
+  zero-output-initialized Map-specific residual `Delta epsilon`.
+- **S2** (`multipath_diffusion_s2_residual_spatial.yaml`) starts from S1 and
+  adds the same spatial supervision as E1.
+
+Spatial supervision is evaluated only for low-noise examples (the first 10%
+of diffusion timesteps) and only against the clean sample that produced that
+noisy example. Classifier-free dropped samples are excluded. This avoids
+pairing a random generated channel with an unrelated channel from the same
+condition and reduces the risk of conditional mean collapse.
+
+Before a long server run, add `--dry-run` to any command below. It performs one
+forward/backward batch, checks all losses and gradients for finiteness, prints
+trainable/total parameter counts, and exits without writing a checkpoint.
+
+```bash
+# E1: initialize from the completed direct B3-S-ID.
+python scripts/train_scene_id_diffusion.py \
+  --config configs/multipath_diffusion_e1_spatial.yaml \
+  --scene-plan artifacts/splits/scene_id_seen_map_v1.json \
+  --initialize-from artifacts/checkpoints/b3_scene_id/best.pt
+
+# S1: initialize the frozen backbone from the matched physics-only B3.
+python scripts/train_scene_id_diffusion.py \
+  --config configs/multipath_diffusion_s1_scene_residual.yaml \
+  --scene-plan artifacts/splits/scene_id_seen_map_v1.json \
+  --initialize-from artifacts/checkpoints/b3_seen_map_baseline/best.pt
+
+# S2: run after S1 and initialize from its best checkpoint.
+python scripts/train_scene_id_diffusion.py \
+  --config configs/multipath_diffusion_s2_residual_spatial.yaml \
+  --scene-plan artifacts/splits/scene_id_seen_map_v1.json \
+  --initialize-from artifacts/checkpoints/b3_s1_scene_residual/best.pt
+```
+
+Every evaluation report now includes both the aggregate active-path
+correlation MAE and two breakdowns under `multipath_distribution`:
+
+- `active_path_correlation_group_mae`: delay-power, delay-angle, power-angle,
+  AoA-AoD and phase-angle error groups;
+- `active_path_correlation_pair_absolute_error`: all 45 individual pairs of
+  the ten active-path features.

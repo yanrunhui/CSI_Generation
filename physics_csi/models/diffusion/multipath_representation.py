@@ -133,9 +133,17 @@ class MultipathRepresentation:
         power_weights = torch.pow(10.0, power_db / 10.0).clamp_min(1e-20) * sorted_mask
 
         def circular(sin_index: int, cos_index: int) -> torch.Tensor:
-            return torch.atan2(
-                sorted_features[:, :, sin_index], sorted_features[:, :, cos_index]
-            )
+            sine = sorted_features[:, :, sin_index]
+            cosine = sorted_features[:, :, cos_index]
+            # atan2 has an undefined derivative at (0, 0).  A denoiser can
+            # produce exactly (or numerically almost) zero circular pairs,
+            # especially near initialization.  Such a pair carries no angle
+            # information, so use the neutral angle 0 and cut its gradient
+            # path instead of allowing a NaN into the spatial auxiliary loss.
+            degenerate = sine.square() + cosine.square() <= 1e-8
+            safe_sine = torch.where(degenerate, torch.zeros_like(sine), sine)
+            safe_cosine = torch.where(degenerate, torch.ones_like(cosine), cosine)
+            return torch.atan2(safe_sine, safe_cosine)
 
         result = {
             "path_mask": sorted_mask,

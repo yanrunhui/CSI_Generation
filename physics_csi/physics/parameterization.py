@@ -116,7 +116,11 @@ class PhysicsAwareParameterization(nn.Module):
             fractions = delay_powers / delay_powers.sum(-1, keepdim=True).clamp_min(self.epsilon)
             mean = (fractions * shape).sum(-1, keepdim=True)
             variance = (fractions * (shape - mean).square()).sum(-1)
-            delay_shape_rms = variance.clamp_min(0.0).sqrt()
+            # sqrt(0) has an infinite derivative.  Degenerate shapes are
+            # repaired below, but autograd still traverses this intermediate
+            # expression and can otherwise turn a masked zero gradient into
+            # NaN.  Clamp before sqrt, matching the final constraint layer.
+            delay_shape_rms = variance.clamp_min(self.epsilon).sqrt()
             positive_target = target_conditions[:, 1] > self.epsilon
             feasible_count = mask.sum(-1) >= 2
             degenerate = positive_target & feasible_count & (delay_shape_rms <= 1e-8)
@@ -127,7 +131,7 @@ class PhysicsAwareParameterization(nn.Module):
                 shape = torch.where(degenerate.unsqueeze(-1), ranks * mask, shape)
                 mean = (fractions * shape).sum(-1, keepdim=True)
                 variance = (fractions * (shape - mean).square()).sum(-1)
-                delay_shape_rms = variance.clamp_min(0.0).sqrt()
+                delay_shape_rms = variance.clamp_min(self.epsilon).sqrt()
                 repaired = degenerate
             delay_scale = torch.where(
                 positive_target & feasible_count,

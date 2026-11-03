@@ -14,9 +14,11 @@ from physics_csi.models.diffusion.multipath_representation import MultipathRepre
 from physics_csi.models.diffusion.noise_schedule import GaussianDiffusion
 from physics_csi.models.diffusion.path_count_model import PathCountPredictor
 from physics_csi.models.diffusion.scene_conditioning import SceneConditionFusion
+from physics_csi.models.diffusion.scene_residual import SceneResidualDenoiser
 from physics_csi.physics.constraints import PhysicsConstraintLayer, check_condition_feasibility
 from physics_csi.physics.parameterization import PhysicsAwareParameterization
 from physics_csi.physics.synthesizer import MIMOOFDMSynthesizer, SystemConfig
+from physics_csi.training.spatial_losses import paired_spatial_losses
 
 
 class MultipathDiffusionModel(nn.Module):
@@ -40,26 +42,38 @@ class MultipathDiffusionModel(nn.Module):
             statistics["condition_mean"], statistics["condition_std"], condition_dim, hidden_dim
         )
         scene_config = dict(config.get("scene_conditioning", {}))
+        adapter_config = dict(config.get("scene_residual_adapter", {}))
         self.scene_conditioning_enabled = bool(scene_config.get("enabled", False))
+        self.scene_adapter_enabled = bool(adapter_config.get("enabled", False))
+        if self.scene_conditioning_enabled and self.scene_adapter_enabled:
+            raise ValueError(
+                "direct scene conditioning and the scene residual adapter are mutually exclusive"
+            )
+        self.scene_aware_enabled = (
+            self.scene_conditioning_enabled or self.scene_adapter_enabled
+        )
         self.map_id_to_index: dict[int, int] = {}
         self.scene_conditioner: SceneConditionFusion | None = None
-        if self.scene_conditioning_enabled:
-            raw_mapping = scene_config.get("map_id_to_index")
+        self.scene_residual_adapter: SceneResidualDenoiser | None = None
+        map_config = scene_config if self.scene_conditioning_enabled else adapter_config
+        if self.scene_aware_enabled:
+            raw_mapping = map_config.get("map_id_to_index")
             if not isinstance(raw_mapping, Mapping) or not raw_mapping:
                 raise ValueError(
-                    "scene-conditioned diffusion requires a non-empty map_id_to_index mapping"
+                    "scene-aware diffusion requires a non-empty map_id_to_index mapping"
                 )
             self.map_id_to_index = {int(key): int(value) for key, value in raw_mapping.items()}
             indices = sorted(self.map_id_to_index.values())
             if indices != list(range(len(indices))) or len(set(indices)) != len(indices):
                 raise ValueError("map_id_to_index values must be unique contiguous indices")
-            self.scene_conditioner = SceneConditionFusion(
-                condition_dim,
-                len(self.map_id_to_index),
-                int(scene_config.get("embedding_dim", 32)),
-                int(scene_config.get("fusion_hidden_dim", hidden_dim)),
-                float(scene_config.get("dropout", config.get("dropout", 0.0))),
-            )
+            if self.scene_conditioning_enabled:
+                self.scene_conditioner = SceneConditionFusion(
+                    condition_dim,
+                    len(self.map_id_to_index),
+                    int(scene_config.get("embedding_dim", 32)),
+                    int(scene_config.get("fusion_hidden_dim", hidden_dim)),
+                    float(scene_config.get("dropout", config.get("dropout", 0.0))),
+                )
         self.path_count_model = PathCountPredictor(
             condition_dim, hidden_dim, self.max_paths, float(config.get("dropout", 0.0))
         )
@@ -83,6 +97,20 @@ class MultipathDiffusionModel(nn.Module):
             float(config.get("dropout", 0.0)),
             int(config["diffusion_steps"]),
         )
+        if self.scene_adapter_enabled:
+            self.scene_residual_adapter = SceneResidualDenoiser(
+                self.representation.feature_dim,
+                condition_dim,
+                int(adapter_config.get("hidden_dim", hidden_dim // 2)),
+                self.max_paths,
+                len(self.map_id_to_index),
+                int(adapter_config.get("embedding_dim", 32)),
+                int(adapter_config.get("layers", 2)),
+                int(adapter_config.get("attention_heads", 4)),
+                float(adapter_config.get("dropout", config.get("dropout", 0.0))),
+                int(config["diffusion_steps"]),
+                float(adapter_config.get("residual_scale", 1.0)),
+            )
         self.diffusion = GaussianDiffusion(
             int(config["diffusion_steps"]), float(config.get("cosine_offset", 0.008))
         )
@@ -91,6 +119,11 @@ class MultipathDiffusionModel(nn.Module):
             self.constraints, parameterization_config
         )
         self.synthesizer = MIMOOFDMSynthesizer(system)
+        self.tx_array_shape = tuple(system.tx_array_shape)
+        self.spatial_supervision = dict(config.get("spatial_supervision", {}))
+        self.spatial_supervision_enabled = bool(
+            self.spatial_supervision.get("enabled", False)
+        )
         count_config = dict(config.get("path_count", {}))
         counts = torch.as_tensor(
             statistics.get("path_count_histogram", [0] + [1] * self.max_paths),
@@ -113,6 +146,16 @@ class MultipathDiffusionModel(nn.Module):
             count_config.get("prior_correction", power > 0.0)
         )
         self.path_count_label_smoothing = float(count_config.get("label_smoothing", 0.0))
+        self.freeze_backbone = bool(
+            self.scene_adapter_enabled and adapter_config.get("freeze_backbone", True)
+        )
+        if self.freeze_backbone:
+            for module in (
+                self.condition_encoder,
+                self.path_count_model,
+                self.denoiser,
+            ):
+                module.requires_grad_(False)
 
     def _path_count_logit_bias(self) -> torch.Tensor | None:
         if not self.path_count_prior_correction:
@@ -131,7 +174,7 @@ class MultipathDiffusionModel(nn.Module):
         map_index: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Resolve external RayVerse Map IDs without treating IDs as numeric features."""
-        if not self.scene_conditioning_enabled:
+        if not self.scene_aware_enabled:
             return None
         if map_index is not None:
             resolved = map_index.to(device=device, dtype=torch.long).reshape(-1)
@@ -139,8 +182,7 @@ class MultipathDiffusionModel(nn.Module):
                 resolved = resolved.expand(batch_size)
             if resolved.shape != (batch_size,):
                 raise ValueError("map_index must be scalar or have shape [batch]")
-            assert self.scene_conditioner is not None
-            if bool(((resolved < 0) | (resolved >= self.scene_conditioner.num_scenes)).any()):
+            if bool(((resolved < 0) | (resolved >= len(self.map_id_to_index))).any()):
                 raise ValueError("map_index is outside the learned embedding table")
             if map_id is not None:
                 external = torch.as_tensor(map_id, dtype=torch.long).reshape(-1)
@@ -185,6 +227,16 @@ class MultipathDiffusionModel(nn.Module):
             )
         return torch.tensor(values, device=device, dtype=torch.long)
 
+    def train(self, mode: bool = True) -> MultipathDiffusionModel:
+        super().train(mode)
+        if self.freeze_backbone:
+            # A frozen B3 must also keep dropout disabled; requires_grad_(False)
+            # alone would still perturb its function in training mode.
+            self.condition_encoder.eval()
+            self.path_count_model.eval()
+            self.denoiser.eval()
+        return self
+
     def condition_embedding(
         self,
         conditions: torch.Tensor,
@@ -212,13 +264,67 @@ class MultipathDiffusionModel(nn.Module):
             return self.scene_conditioner.unconditional(batch_size, device)
         return self.condition_encoder.unconditional(batch_size, device)
 
+    def path_count_logits(
+        self,
+        condition_embedding: torch.Tensor,
+        *,
+        map_index: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Path-count logits for calibration and training.
+
+        S1/S2 intentionally retain the B3 path-count branch; their residual
+        adapter corrects only epsilon prediction so path-count quality cannot
+        be traded away for a spatial improvement.
+        """
+        if self.scene_adapter_enabled and map_index is None:
+            raise ValueError("scene residual path-count inference requires map_index")
+        return self.path_count_model(condition_embedding)
+
+    def _predict_noise(
+        self,
+        noisy: torch.Tensor,
+        timestep: torch.Tensor,
+        condition_embedding: torch.Tensor,
+        path_count: torch.Tensor,
+        path_mask: torch.Tensor,
+        *,
+        map_index: torch.Tensor | None,
+        drop_mask: torch.Tensor | None,
+        unconditional: bool,
+    ) -> torch.Tensor:
+        embedding = (
+            self.unconditional_embedding(noisy.shape[0], noisy.device)
+            if unconditional
+            else condition_embedding
+        )
+        base = self.denoiser(noisy, timestep, embedding, path_count, path_mask)
+        if not self.scene_adapter_enabled or unconditional:
+            return base
+        if map_index is None or self.scene_residual_adapter is None:
+            raise RuntimeError("scene residual adapter is missing its Map index")
+        return base + self.scene_residual_adapter(
+            noisy,
+            base,
+            timestep,
+            condition_embedding,
+            map_index,
+            path_count,
+            path_mask,
+            drop_mask=drop_mask,
+        )
+
     def scene_gradient_norm(self) -> torch.Tensor | None:
         """Return an L2 norm used to detect a disconnected/ignored scene branch."""
-        if self.scene_conditioner is None:
+        scene_module: nn.Module | None = (
+            self.scene_conditioner
+            if self.scene_conditioner is not None
+            else self.scene_residual_adapter
+        )
+        if scene_module is None:
             return None
         squares = [
             parameter.grad.detach().float().square().sum()
-            for parameter in self.scene_conditioner.parameters()
+            for parameter in scene_module.parameters()
             if parameter.grad is not None
         ]
         if not squares:
@@ -230,10 +336,21 @@ class MultipathDiffusionModel(nn.Module):
         validity = batch.get("condition_validity")
         map_id = batch.get("map_id")
         map_index = batch.get("map_index")
-        full_condition = self.condition_embedding(
-            conditions, validity, map_id=map_id, map_index=map_index
+        resolved_map_index = self.map_indices(
+            map_id,
+            conditions.shape[0],
+            conditions.device,
+            map_index=map_index,
         )
-        count_logits = self.path_count_model(full_condition)
+        full_condition = self.condition_embedding(
+            conditions,
+            validity,
+            map_id=map_id,
+            map_index=resolved_map_index,
+        )
+        count_logits = self.path_count_logits(
+            full_condition, map_index=resolved_map_index
+        )
         path_count = batch["path_count"].long().clamp(1, self.max_paths)
         count_loss = F.cross_entropy(
             count_logits,
@@ -256,24 +373,30 @@ class MultipathDiffusionModel(nn.Module):
             conditions,
             validity,
             map_id=map_id,
-            map_index=map_index,
+            map_index=resolved_map_index,
             drop_mask=drop_mask,
         )
 
         def predict(noisy: torch.Tensor, timestep: torch.Tensor, unconditional: bool) -> torch.Tensor:
-            embedding = (
-                self.unconditional_embedding(noisy.shape[0], noisy.device)
-                if unconditional
-                else train_condition
+            return self._predict_noise(
+                noisy,
+                timestep,
+                train_condition,
+                path_count,
+                batch["path_mask"],
+                map_index=resolved_map_index,
+                drop_mask=drop_mask,
+                unconditional=unconditional,
             )
-            return self.denoiser(noisy, timestep, embedding, path_count, batch["path_mask"])
 
-        diffusion_loss = self.diffusion.training_loss(
+        prediction = self.diffusion.training_prediction(
             features, predict, element_mask=feature_mask
         )
+        diffusion_loss = prediction["loss"]
         weight = float(self.config.get("path_count_loss_weight", 1.0))
-        return {
-            "loss": diffusion_loss + weight * count_loss,
+        total_loss = diffusion_loss + weight * count_loss
+        result = {
+            "loss": total_loss,
             "diffusion_loss": diffusion_loss,
             "path_count_loss": count_loss,
             "path_count_accuracy": (
@@ -282,6 +405,89 @@ class MultipathDiffusionModel(nn.Module):
             "path_count_accuracy_weighted_logits": (
                 count_logits.argmax(-1) == path_count - 1
             ).float().mean(),
+        }
+        if self.spatial_supervision_enabled:
+            auxiliary = self._spatial_auxiliary_losses(
+                prediction["predicted_clean"],
+                prediction["timestep"],
+                batch,
+                conditions,
+                validity,
+                drop_mask,
+            )
+            beam_weight = float(self.spatial_supervision.get("beamspace_weight", 0.0))
+            spatial_weight = float(self.spatial_supervision.get("spatial_weight", 0.0))
+            weighted_auxiliary = (
+                beam_weight * auxiliary["beamspace_loss"]
+                + spatial_weight * auxiliary["spatial_loss"]
+            )
+            result.update(auxiliary)
+            result["spatial_auxiliary_weighted"] = weighted_auxiliary
+            result["loss"] = total_loss + weighted_auxiliary
+        return result
+
+    def _spatial_auxiliary_losses(
+        self,
+        predicted_clean: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: Mapping[str, torch.Tensor],
+        conditions: torch.Tensor,
+        validity: torch.Tensor | None,
+        drop_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if "csi" not in batch:
+            raise KeyError("spatial supervision requires paired CSI in each batch")
+        maximum_fraction = float(
+            self.spatial_supervision.get("maximum_timestep_fraction", 0.10)
+        )
+        if not 0.0 < maximum_fraction <= 1.0:
+            raise ValueError("maximum_timestep_fraction must be in (0, 1]")
+        maximum_timestep = max(0, int(self.diffusion.timesteps * maximum_fraction) - 1)
+        # Classifier-free dropped examples must remain unconditional; applying
+        # a paired target to them would leak conditions into the null branch.
+        selected = (timesteps <= maximum_timestep) & ~drop_mask.bool()
+        selected_fraction = selected.float().mean()
+        if not bool(selected.any()):
+            # Preserve a valid graph on the rare batch with no low-noise draw.
+            zero = predicted_clean.sum() * 0.0
+            return {
+                "beamspace_loss": zero,
+                "spatial_loss": zero,
+                "spatial_supervision_fraction": selected_fraction,
+            }
+        clipped = predicted_clean[selected].clamp(
+            -float(self.config.get("clip_denoised", 5.0)),
+            float(self.config.get("clip_denoised", 5.0)),
+        )
+        path_mask = batch["path_mask"][selected].bool()
+        raw = self.representation.decode(clipped, path_mask)
+        selected_validity = (
+            validity[selected]
+            if validity is not None
+            else torch.ones_like(conditions[selected], dtype=torch.bool)
+        )
+        parameterized = self.parameterization(
+            raw, conditions[selected], selected_validity
+        )
+        constrained = parameterized.constrained
+        predicted_csi = self.synthesizer(
+            constrained.delays_ns,
+            constrained.powers_linear,
+            raw["path_phases_rad"],
+            raw["aoa_az_deg"],
+            raw["aoa_el_deg"],
+            raw["aod_az_deg"],
+            raw["aod_el_deg"],
+            raw["path_mask"],
+        )
+        target_csi = batch["csi"][selected].to(torch.complex64)
+        beamspace_loss, spatial_loss = paired_spatial_losses(
+            predicted_csi, target_csi, self.tx_array_shape
+        )
+        return {
+            "beamspace_loss": beamspace_loss,
+            "spatial_loss": spatial_loss,
+            "spatial_supervision_fraction": selected_fraction,
         }
 
     @torch.no_grad()
@@ -312,10 +518,23 @@ class MultipathDiffusionModel(nn.Module):
             map_id=map_id,
             map_index=resolved_map_index,
         )
-        count_probabilities = self.path_count_model.probabilities(
-            embedding,
-            temperature=path_count_temperature,
-            logit_bias=self._path_count_logit_bias(),
+        count_logits = self.path_count_logits(
+            embedding, map_index=resolved_map_index
+        )
+        if path_count_temperature <= 0:
+            raise ValueError("path-count temperature must be positive")
+        logit_bias = self._path_count_logit_bias()
+        count_probabilities = torch.softmax(
+            (
+                count_logits
+                + (
+                    logit_bias.to(count_logits)
+                    if logit_bias is not None
+                    else 0.0
+                )
+            )
+            / float(path_count_temperature),
+            dim=-1,
         )
         sampled_count = torch.multinomial(
             count_probabilities, 1, generator=generator
@@ -341,12 +560,16 @@ class MultipathDiffusionModel(nn.Module):
         feature_mask = self.representation.feature_mask(path_mask)
 
         def predict(noisy: torch.Tensor, timestep: torch.Tensor, unconditional: bool) -> torch.Tensor:
-            selected = (
-                self.unconditional_embedding(num_samples, noisy.device)
-                if unconditional
-                else embedding
+            return self._predict_noise(
+                noisy,
+                timestep,
+                embedding,
+                count,
+                path_mask,
+                map_index=resolved_map_index,
+                drop_mask=None,
+                unconditional=unconditional,
             )
-            return self.denoiser(noisy, timestep, selected, count, path_mask)
 
         features = self.diffusion.sample(
             (num_samples, self.max_paths, self.representation.feature_dim),
@@ -443,7 +666,7 @@ class MultipathDiffusionModel(nn.Module):
             result["raw_path_delays_ns"] = raw["path_delays_ns"]
         if "relative_delay_shape" in raw:
             result["raw_relative_delay_shape"] = raw["relative_delay_shape"]
-        if self.scene_conditioning_enabled:
+        if self.scene_aware_enabled:
             assert resolved_map_index is not None
             result["map_index"] = resolved_map_index
             result["map_id"] = torch.as_tensor(

@@ -3,6 +3,20 @@ from __future__ import annotations
 import torch
 
 
+ACTIVE_PATH_FEATURE_NAMES = (
+    "delay_ns",
+    "power_fraction_db",
+    "phase_sin",
+    "phase_cos",
+    "aoa_az_sin",
+    "aoa_az_cos",
+    "aoa_el_scaled",
+    "aod_az_sin",
+    "aod_az_cos",
+    "aod_el_scaled",
+)
+
+
 def multipath_features(payload: dict[str, torch.Tensor]) -> torch.Tensor:
     mask = payload["path_mask"].bool()
     powers = payload["path_powers_linear"] * mask
@@ -205,11 +219,35 @@ def correlation_curve(csi: torch.Tensor, dimension: str) -> torch.Tensor:
     )
 
 
+def _correlation_error_breakdown(
+    generated: torch.Tensor, reference: torch.Tensor
+) -> tuple[torch.Tensor, dict[str, float], dict[str, float]]:
+    error = (
+        _correlation_matrix(generated) - _correlation_matrix(reference)
+    ).abs()
+    pairs = {
+        f"{ACTIVE_PATH_FEATURE_NAMES[first]}__{ACTIVE_PATH_FEATURE_NAMES[second]}": float(
+            error[first, second]
+        )
+        for first in range(len(ACTIVE_PATH_FEATURE_NAMES))
+        for second in range(first + 1, len(ACTIVE_PATH_FEATURE_NAMES))
+    }
+    angle_indices = tuple(range(4, 10))
+    groups = {
+        "delay_power": float(error[0, 1]),
+        "delay_angle": float(error[0, list(angle_indices)].mean()),
+        "power_angle": float(error[1, list(angle_indices)].mean()),
+        "aoa_aod": float(error[4:7, 7:10].mean()),
+        "phase_angle": float(error[2:4, 4:10].mean()),
+    }
+    return error, pairs, groups
+
+
 def distribution_metrics(
     generated: dict[str, torch.Tensor],
     reference: dict[str, torch.Tensor],
     bandwidths: list[float],
-) -> dict[str, float]:
+) -> dict[str, object]:
     generated_features = multipath_features(generated)
     reference_features = multipath_features(reference)
     feature_mean = reference_features.mean(dim=0, keepdim=True)
@@ -224,6 +262,9 @@ def distribution_metrics(
     reference_full = (reference_full - full_mean) / full_std
     generated_active = _active_path_features(generated)
     reference_active = _active_path_features(reference)
+    correlation_error, correlation_pairs, correlation_groups = (
+        _correlation_error_breakdown(generated_active, reference_active)
+    )
     frequency_generated = correlation_curve(generated["csi"], "frequency")
     frequency_reference = correlation_curve(reference["csi"], "frequency")
     spatial_generated = correlation_curve(generated["csi"], "space")
@@ -240,11 +281,10 @@ def distribution_metrics(
             sliced_wasserstein(generated_full, reference_full)
         ),
         "active_path_correlation_mae": float(
-            (
-                _correlation_matrix(generated_active)
-                - _correlation_matrix(reference_active)
-            ).abs().mean()
+            correlation_error.mean()
         ),
+        "active_path_correlation_pair_absolute_error": correlation_pairs,
+        "active_path_correlation_group_mae": correlation_groups,
         "frequency_correlation_mae": float(
             (frequency_generated - frequency_reference).abs().mean()
         ),

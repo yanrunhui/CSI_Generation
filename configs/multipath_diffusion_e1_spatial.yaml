@@ -1,0 +1,74 @@
+# E1: fine-tune the existing direct B3-S-ID model with paired low-noise
+# beamspace and phase-sensitive spatial-covariance supervision.
+statistics_path: artifacts/statistics/diffusion_seen_map_e1_spatial.json
+statistics_batch_size: 512
+
+multipath_diffusion:
+  max_paths: 5
+  hidden_dim: 256
+  condition_embedding_dim: 128
+  layers: 4
+  attention_heads: 8
+  dropout: 0.05
+  diffusion_steps: 1000
+  cosine_offset: 0.008
+  clip_denoised: 5.0
+  condition_dropout: 0.10
+  path_count_loss_weight: 1.0
+  scene_conditioning:
+    enabled: true
+    embedding_dim: 32
+    fusion_hidden_dim: 256
+    dropout: 0.05
+    map_id_to_index: {}
+  scene_residual_adapter:
+    enabled: false
+  spatial_supervision:
+    enabled: true
+    # Both losses are bounded/normalized; these weights keep the auxiliary
+    # term weak relative to epsilon prediction and avoid spatial mode collapse.
+    beamspace_weight: 0.05
+    spatial_weight: 0.02
+    maximum_timestep_fraction: 0.10
+  path_count:
+    class_weight_power: 0.5
+    max_weight_ratio: 4.0
+    prior_correction: true
+    label_smoothing: 0.01
+  parameterization:
+    mode: structured
+    structured_delay: true
+    structured_power: true
+    structured_k_factor: true
+    epsilon: 1.0e-20
+  constraints:
+    enforce_total_power: true
+    enforce_delay_spread: true
+    enforce_k_factor: true
+    enforce_los_direct_path: true
+    epsilon: 1.0e-20
+
+sampling:
+  sampler: ddim
+  sampling_steps: 100
+  eta: 0.0
+  guidance_scale: 1.0
+  path_count_temperature: 1.0
+
+train:
+  seed: 2026
+  device: auto
+  # 21 fine-tuning passes (epoch 0..20) from the completed B3-S-ID checkpoint.
+  epochs: 21
+  batch_size: 256
+  num_workers: 4
+  learning_rate: 5.0e-5
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  mixed_precision: false
+  ema_decay: 0.999
+  patience: 20
+  lr_patience: 6
+  lr_reduce_factor: 0.5
+  checkpoint_dir: artifacts/checkpoints/b3_e1_spatial
+  log_every_steps: 20

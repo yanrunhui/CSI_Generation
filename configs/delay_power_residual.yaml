@@ -1,0 +1,51 @@
+delay_power_residual:
+  hidden_dim: 128
+  map_embedding_dim: 32
+  condition_hidden_dim: 64
+  layers: 2
+  attention_heads: 4
+  dropout: 0.05
+  maximum_delay_log_shift: 1.0
+  maximum_power_logit_shift: 2.0
+
+distribution_loss:
+  projections: 64
+  weighted_delay_bins: 64
+  weighted_delay_maximum: 8.0
+  weighted_delay_temperature: 0.08
+  margin: 0.02
+  diversity_minimum_ratio: 0.80
+  weights:
+    path_swd: 1.0
+    link_swd: 1.0
+    power_weighted_delay: 0.5
+    shuffled_margin: 0.5
+    residual_strength: 0.01
+    diversity: 0.10
+
+train:
+  seed: 2026
+  device: auto
+  epochs: 80
+  batch_size: 32
+  minimum_batch_size: 12
+  train_batches_per_epoch: 800
+  validation_batches_per_epoch: 200
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  mixed_precision: false
+  ema_decay: 0.995
+  patience: 15
+  lr_patience: 5
+  lr_reduce_factor: 0.5
+  checkpoint_dir: artifacts/checkpoints/delay_power_residual
+  log_every_steps: 25
+
+evaluation:
+  split: test
+  maximum_samples_per_map: 64
+  minimum_samples_per_map: 12
+  bootstrap_samples: 10000
+  batch_size: 256
+

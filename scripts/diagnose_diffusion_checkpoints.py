@@ -29,7 +29,14 @@ def _build_model(checkpoint: dict[str, Any], device: torch.device) -> torch.nn.M
     config = checkpoint["config"]
     system = SystemConfig.from_mapping(config["data"]["system"])
     kind = checkpoint.get("model_kind")
-    if kind == "multipath_diffusion":
+    if kind in {
+        "multipath_diffusion",
+        "multipath_diffusion_seen_map_baseline",
+        "multipath_diffusion_scene_id",
+        "multipath_diffusion_scene_id_spatial",
+        "multipath_diffusion_scene_residual",
+        "multipath_diffusion_scene_residual_spatial",
+    }:
         model = MultipathDiffusionModel(
             config["multipath_diffusion"], system, checkpoint["statistics"]
         )

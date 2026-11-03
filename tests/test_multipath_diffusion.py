@@ -6,7 +6,10 @@ import pytest
 from physics_csi.models.blocks import mask_from_path_count
 from physics_csi.models.diffusion.multipath_diffusion import MultipathDiffusionModel
 from physics_csi.models.diffusion.noise_schedule import GaussianDiffusion
+from physics_csi.physics.constraints import PhysicsConstraintLayer
+from physics_csi.physics.parameterization import PhysicsAwareParameterization
 from physics_csi.physics.synthesizer import SystemConfig
+from physics_csi.training.spatial_losses import paired_spatial_losses
 
 
 def _stats() -> dict[str, object]:
@@ -212,4 +215,190 @@ def test_scene_id_generation_rejects_unseen_map() -> None:
     )
     assert generated["map_id"].tolist() == [7, 7]
     assert generated["map_index"].tolist() == [1, 1]
+
+
+def test_paired_spatial_losses_are_zero_for_identical_csi() -> None:
+    generator = torch.Generator().manual_seed(17)
+    real = torch.randn(3, 1, 4, 8, generator=generator)
+    imaginary = torch.randn(3, 1, 4, 8, generator=generator)
+    csi = torch.complex(real, imaginary)
+    beamspace, spatial = paired_spatial_losses(csi, csi.clone(), (2, 2))
+    assert float(beamspace) == pytest.approx(0.0, abs=1e-8)
+    assert float(spatial) == pytest.approx(0.0, abs=1e-8)
+    changed = csi.clone()
+    changed[:, :, 0] = changed[:, :, 0] * torch.exp(torch.tensor(0.7j))
+    _, changed_spatial = paired_spatial_losses(changed, csi, (2, 2))
+    assert float(changed_spatial) > 0.0
+
+
+def test_zero_csi_spatial_losses_have_finite_gradient() -> None:
+    real = torch.zeros(2, 1, 4, 8, requires_grad=True)
+    imaginary = torch.zeros_like(real)
+    predicted = torch.complex(real, imaginary)
+    target = torch.zeros_like(predicted)
+    beamspace, spatial = paired_spatial_losses(predicted, target, (2, 2))
+    (beamspace + spatial).backward()
+    assert real.grad is not None
+    assert torch.isfinite(real.grad).all()
+
+
+def test_degenerate_structured_delay_has_finite_gradient() -> None:
+    constraints = PhysicsConstraintLayer(
+        enforce_total_power=True,
+        enforce_delay_spread=True,
+        enforce_k_factor=True,
+        enforce_los_direct_path=True,
+        epsilon=1e-20,
+    )
+    parameterization = PhysicsAwareParameterization(
+        constraints,
+        {
+            "mode": "structured",
+            "structured_delay": True,
+            "structured_power": True,
+            "structured_k_factor": True,
+            "epsilon": 1e-20,
+        },
+    )
+    delay_shape = torch.zeros(1, 3, requires_grad=True)
+    power_weights = torch.ones(1, 3, requires_grad=True)
+    raw = {
+        "path_mask": torch.tensor([[True, True, False]]),
+        "positive_power_weights": power_weights,
+        "relative_delay_shape": delay_shape,
+        "first_delay_ns": torch.tensor([5.0], requires_grad=True),
+    }
+    conditions = torch.tensor([[-80.0, 10.0, 3.0, 1.0]])
+    validity = torch.ones(1, 4, dtype=torch.bool)
+    result = parameterization(raw, conditions, validity)
+    loss = (
+        result.constrained.delays_ns.sum()
+        + result.constrained.powers_linear.sum()
+    )
+    loss.backward()
+    for tensor in (delay_shape, power_weights, raw["first_delay_ns"]):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+
+
+def test_low_noise_spatial_supervision_is_finite_and_differentiable() -> None:
+    config = _config()
+    config["condition_dropout"] = 0.0
+    config["scene_conditioning"] = {
+        "enabled": True,
+        "embedding_dim": 8,
+        "fusion_hidden_dim": 32,
+        "map_id_to_index": {"0": 0, "7": 1},
+    }
+    config["spatial_supervision"] = {
+        "enabled": True,
+        "beamspace_weight": 0.05,
+        "spatial_weight": 0.02,
+        "maximum_timestep_fraction": 1.0,
+    }
+    system = SystemConfig(num_subcarriers=8, tx_array_shape=(2, 2))
+    model = MultipathDiffusionModel(config, system, _stats())
+    batch = _batch()
+    batch["map_id"] = torch.tensor([0, 7])
+    batch["csi"] = model.synthesizer(
+        batch["path_delays_ns"],
+        batch["path_powers_linear"],
+        batch["path_phases_rad"],
+        batch["aoa_az_deg"],
+        batch["aoa_el_deg"],
+        batch["aod_az_deg"],
+        batch["aod_el_deg"],
+        batch["path_mask"],
+    ).detach()
+    metrics = model(batch)
+    assert set(metrics) >= {
+        "beamspace_loss",
+        "spatial_loss",
+        "spatial_auxiliary_weighted",
+        "spatial_supervision_fraction",
+    }
+    assert all(torch.isfinite(value) for value in metrics.values())
+    metrics["loss"].backward()
+    gradient_norm = model.scene_gradient_norm()
+    assert gradient_norm is not None and torch.isfinite(gradient_norm)
+
+
+def test_scene_residual_adapter_starts_as_exact_frozen_b3() -> None:
+    base_config = _config()
+    base_config["condition_dropout"] = 0.0
+    base = MultipathDiffusionModel(
+        base_config,
+        SystemConfig(num_subcarriers=8, tx_array_shape=(2, 2)),
+        _stats(),
+    ).eval()
+    residual_config = _config()
+    residual_config["condition_dropout"] = 0.0
+    residual_config["scene_residual_adapter"] = {
+        "enabled": True,
+        "map_id_to_index": {"0": 0, "7": 1},
+        "embedding_dim": 8,
+        "hidden_dim": 16,
+        "layers": 1,
+        "attention_heads": 4,
+        "dropout": 0.0,
+        "freeze_backbone": True,
+    }
+    residual = MultipathDiffusionModel(
+        residual_config,
+        SystemConfig(num_subcarriers=8, tx_array_shape=(2, 2)),
+        _stats(),
+    ).eval()
+    compatible = {
+        key: value
+        for key, value in base.state_dict().items()
+        if key in residual.state_dict() and residual.state_dict()[key].shape == value.shape
+    }
+    residual.load_state_dict(compatible, strict=False)
+    batch = _batch()
+    features, _ = base.representation.encode(batch)
+    timestep = torch.tensor([1, 2])
+    base_condition = base.condition_embedding(
+        batch["conditions"], batch["condition_validity"]
+    )
+    residual_condition = residual.condition_embedding(
+        batch["conditions"], batch["condition_validity"]
+    )
+    base_prediction = base._predict_noise(
+        features,
+        timestep,
+        base_condition,
+        batch["path_count"],
+        batch["path_mask"],
+        map_index=None,
+        drop_mask=None,
+        unconditional=False,
+    )
+    map_index = residual.map_indices(
+        torch.tensor([0, 7]), 2, features.device
+    )
+    residual_prediction = residual._predict_noise(
+        features,
+        timestep,
+        residual_condition,
+        batch["path_count"],
+        batch["path_mask"],
+        map_index=map_index,
+        drop_mask=None,
+        unconditional=False,
+    )
+    assert torch.allclose(base_prediction, residual_prediction, atol=1e-6, rtol=1e-6)
+    assert not any(parameter.requires_grad for parameter in residual.denoiser.parameters())
+    assert residual.scene_residual_adapter is not None
+    assert all(
+        parameter.requires_grad
+        for parameter in residual.scene_residual_adapter.parameters()
+    )
+    residual.train()
+    training_batch = _batch()
+    training_batch["map_id"] = torch.tensor([0, 7])
+    metrics = residual(training_batch)
+    metrics["loss"].backward()
+    gradient_norm = residual.scene_gradient_norm()
+    assert gradient_norm is not None and float(gradient_norm) > 0.0
+    assert all(parameter.grad is None for parameter in residual.denoiser.parameters())
 

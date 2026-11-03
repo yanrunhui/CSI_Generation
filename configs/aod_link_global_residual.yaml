@@ -1,0 +1,50 @@
+aod_architecture: link_global
+
+link_global_aod_residual:
+  hidden_dim: 128
+  map_embedding_dim: 32
+  condition_hidden_dim: 64
+  dropout: 0.05
+  maximum_azimuth_residual_deg: 20.0
+  maximum_elevation_residual_deg: 10.0
+  initial_gate: 0.10
+
+distribution_loss:
+  projections: 64
+  weighted_quantiles: 128
+  margin: 0.01
+  diversity_minimum_ratio: 0.85
+  weights:
+    path_power_aod: 0.5
+    delay_power_aod: 0.5
+    link_power_aod: 1.0
+    power_weighted_aod: 2.0
+    shuffled_margin: 0.5
+    residual_strength: 0.02
+    diversity: 0.10
+
+train:
+  seed: 2026
+  device: auto
+  epochs: 80
+  batch_size: 32
+  minimum_batch_size: 12
+  train_batches_per_epoch: 800
+  validation_batches_per_epoch: 200
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  mixed_precision: false
+  ema_decay: 0.995
+  patience: 15
+  lr_patience: 5
+  lr_reduce_factor: 0.5
+  checkpoint_dir: artifacts/checkpoints/aod_link_global_residual
+  log_every_steps: 25
+
+evaluation:
+  split: test
+  maximum_samples_per_map: 64
+  minimum_samples_per_map: 12
+  bootstrap_samples: 10000
+  batch_size: 256

@@ -69,6 +69,25 @@ def test_delay_and_circular_representations() -> None:
     assert torch.allclose(decoded["aoa_az_deg"][:, :2], batch["aoa_az_deg"][:, :2], atol=1e-4)
 
 
+def test_degenerate_circular_representation_has_finite_gradient() -> None:
+    codec = MultipathRepresentation(
+        _statistics()["multipath"],  # type: ignore[arg-type]
+        max_paths=3,
+        delay_mode="rms_normalized_shape",
+    )
+    features = torch.zeros(1, 3, codec.feature_dim, requires_grad=True)
+    mask = torch.tensor([[True, True, False]])
+    decoded = codec.decode(features, mask)
+    loss = (
+        decoded["path_phases_rad"].sum()
+        + decoded["aoa_az_deg"].sum()
+        + decoded["aod_az_deg"].sum()
+    )
+    loss.backward()
+    assert features.grad is not None
+    assert torch.isfinite(features.grad).all()
+
+
 def test_structured_delay_representation_has_unit_weighted_rms() -> None:
     codec = MultipathRepresentation(
         _statistics()["multipath"],  # type: ignore[arg-type]

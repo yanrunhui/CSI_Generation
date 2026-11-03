@@ -49,8 +49,13 @@ class DiffusionTrainer:
         self.model_kind = model_kind
         self.device = resolve_device(str(self.config.get("device", "auto")))
         self.model = model.to(self.device)
+        trainable_parameters = [
+            parameter for parameter in self.model.parameters() if parameter.requires_grad
+        ]
+        if not trainable_parameters:
+            raise ValueError("model has no trainable parameters")
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            trainable_parameters,
             lr=float(self.config["learning_rate"]),
             weight_decay=float(self.config.get("weight_decay", 0.0)),
         )
@@ -141,7 +146,17 @@ class DiffusionTrainer:
                         self.model.parameters(), float(self.config.get("gradient_clip_norm", 1.0))
                     )
                     if not torch.isfinite(gradient_norm) and not self.use_amp:
-                        raise FloatingPointError("non-finite diffusion gradient norm")
+                        nonfinite_parameters = [
+                            name
+                            for name, parameter in self.model.named_parameters()
+                            if parameter.grad is not None
+                            and not bool(torch.isfinite(parameter.grad).all())
+                        ]
+                        preview = ", ".join(nonfinite_parameters[:12]) or "unknown"
+                        raise FloatingPointError(
+                            "non-finite diffusion gradient norm; parameters: "
+                            f"{preview}"
+                        )
                     scale_before = self.scaler.get_scale()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -185,7 +200,7 @@ class DiffusionTrainer:
         if train:
             result["skipped_nonfinite_updates"] = float(skipped_updates)
             if (
-                bool(getattr(self.model, "scene_conditioning_enabled", False))
+                bool(getattr(self.model, "scene_aware_enabled", False))
                 and result.get("scene_gradient_nonzero", 0.0) == 0.0
             ):
                 raise RuntimeError(

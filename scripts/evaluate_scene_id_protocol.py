@@ -231,8 +231,14 @@ def main() -> None:
     scene_checkpoint = torch.load(
         args.scene_checkpoint, map_location="cpu", weights_only=False
     )
-    if scene_checkpoint.get("model_kind") != "multipath_diffusion_scene_id":
-        raise ValueError("--scene-checkpoint is not a B3-S-ID checkpoint")
+    scene_kinds = {
+        "multipath_diffusion_scene_id",
+        "multipath_diffusion_scene_id_spatial",
+        "multipath_diffusion_scene_residual",
+        "multipath_diffusion_scene_residual_spatial",
+    }
+    if scene_checkpoint.get("model_kind") not in scene_kinds:
+        raise ValueError("--scene-checkpoint is not a supported scene-aware checkpoint")
     scene_config = scene_checkpoint["config"]
     plan = scene_config.get("scene_id_experiment")
     if plan is None:

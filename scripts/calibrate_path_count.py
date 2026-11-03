@@ -91,7 +91,18 @@ def main() -> None:
                     batch.get("map_index").to(device) if "map_index" in batch else None
                 ),
             )
-            value = model.path_count_model(embedding)
+            resolved_map_index = model.map_indices(
+                batch.get("map_id").to(device) if "map_id" in batch else None,
+                conditions.shape[0],
+                device,
+                map_index=(
+                    batch.get("map_index").to(device)
+                    if "map_index" in batch else None
+                ),
+            )
+            value = model.path_count_logits(
+                embedding, map_index=resolved_map_index
+            )
             bias = model._path_count_logit_bias()
             if bias is not None:
                 value = value + bias.to(value)

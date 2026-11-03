@@ -110,6 +110,9 @@ def evaluate_generated_payload(
     if model_kind in {
         "multipath_diffusion",
         "multipath_diffusion_scene_id",
+        "multipath_diffusion_scene_id_spatial",
+        "multipath_diffusion_scene_residual",
+        "multipath_diffusion_scene_residual_spatial",
         "multipath_diffusion_seen_map_baseline",
     }:
         report["condition_accuracy"] = condition_accuracy(

@@ -64,8 +64,14 @@ def main() -> None:
     args = parser.parse_args()
     device = resolve_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if checkpoint.get("model_kind") != "multipath_diffusion_scene_id":
-        raise ValueError("checkpoint is not a B3-S-ID model")
+    scene_kinds = {
+        "multipath_diffusion_scene_id",
+        "multipath_diffusion_scene_id_spatial",
+        "multipath_diffusion_scene_residual",
+        "multipath_diffusion_scene_residual_spatial",
+    }
+    if checkpoint.get("model_kind") not in scene_kinds:
+        raise ValueError("checkpoint is not a supported scene-aware model")
     config = checkpoint["config"]
     plan = config.get("scene_id_experiment")
     if plan is None:
@@ -126,7 +132,7 @@ def main() -> None:
     torch.save(
         {
             "format_version": 1,
-            "model_kind": "multipath_diffusion_scene_id",
+            "model_kind": checkpoint["model_kind"],
             "generated": _cpu(generated),
             "conditions": conditions,
             "map_id": args.map_id,

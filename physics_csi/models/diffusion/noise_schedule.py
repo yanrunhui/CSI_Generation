@@ -70,9 +70,26 @@ class GaussianDiffusion(nn.Module):
         *,
         element_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        return self.training_prediction(
+            clean, predict_noise, element_mask=element_mask
+        )["loss"]
+
+    def training_prediction(
+        self,
+        clean: torch.Tensor,
+        predict_noise: Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor],
+        *,
+        element_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run one epsilon-prediction step and expose its paired clean estimate.
+
+        ``predicted_clean`` is useful for low-noise auxiliary supervision.  The
+        original ``training_loss`` API remains unchanged for other models.
+        """
         batch = clean.shape[0]
         timestep = torch.randint(0, self.timesteps, (batch,), device=clean.device)
         noise = torch.randn_like(clean)
+        mask: torch.Tensor | None = None
         if element_mask is not None:
             mask = element_mask.to(dtype=clean.dtype, device=clean.device)
             clean = clean * mask
@@ -81,10 +98,26 @@ class GaussianDiffusion(nn.Module):
         prediction = predict_noise(noisy, timestep, False)
         error = (prediction - target).square()
         if element_mask is None:
-            return error.flatten(1).mean(dim=1).mean()
-        error = error * mask
-        denominator = mask.flatten(1).sum(dim=1).clamp_min(1.0)
-        return (error.flatten(1).sum(dim=1) / denominator).mean()
+            loss = error.flatten(1).mean(dim=1).mean()
+        else:
+            assert mask is not None
+            error = error * mask
+            denominator = mask.flatten(1).sum(dim=1).clamp_min(1.0)
+            loss = (error.flatten(1).sum(dim=1) / denominator).mean()
+        predicted_clean = (
+            _extract(self.sqrt_recip_alpha_bar, timestep, noisy.shape) * noisy
+            - _extract(self.sqrt_recipm1_alpha_bar, timestep, noisy.shape) * prediction
+        )
+        if mask is not None:
+            predicted_clean = predicted_clean * mask
+        return {
+            "loss": loss,
+            "timestep": timestep,
+            "noisy": noisy,
+            "target_noise": target,
+            "predicted_noise": prediction,
+            "predicted_clean": predicted_clean,
+        }
 
     def _guided_prediction(
         self,

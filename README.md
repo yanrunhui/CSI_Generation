@@ -219,3 +219,13 @@ The repository includes tests under `tests/`, but no training or tests were run
 during the local code-generation task. Execute them in the intended server
 environment after installing the declared dependencies.
 
+Before training a geometry-conditioned B3-S-Geo variant, run the three
+[scene-representation diagnostics](docs/SCENE_RESEARCH_DIAGNOSTICS.md): Map ×
+condition support, real-data Map-feature learnability without diffusion, and
+physical-parameter/spatial-error attribution.
+
+The next low-cost gate is the
+[B3-S-Geo-lite geometry probe](docs/B3_S_GEO_LITE_PROBE.md), which extracts
+building statistics and compares physical-only, Map-ID, and geometry-aware
+predictors on both seen-Map spatial holdouts and completely unseen Maps.
+
