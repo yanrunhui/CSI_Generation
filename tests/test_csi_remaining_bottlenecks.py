@@ -94,6 +94,48 @@ def test_tx_spacing_groups_cover_every_off_diagonal_pair() -> None:
     assert min(group["distance_wavelengths"] for group in groups.values()) == 0.5
 
 
+def test_delay_composition_and_linear_phase_removal() -> None:
+    base = _payload(samples=4)
+    donor = {key: value.clone() for key, value in base.items()}
+    donor["path_delays_ns"] = base["path_delays_ns"] + torch.tensor(
+        [[100.0, 102.0, 106.0]]
+    )
+    offset_only = diagnostic._compose_path_delays_ns(donor, base)
+    relative_only = diagnostic._compose_path_delays_ns(base, donor)
+    assert torch.allclose(
+        offset_only - offset_only[:, :1],
+        base["path_delays_ns"] - base["path_delays_ns"][:, :1],
+    )
+    assert torch.allclose(
+        relative_only - relative_only[:, :1],
+        donor["path_delays_ns"] - donor["path_delays_ns"][:, :1],
+    )
+
+    system = SystemConfig(num_subcarriers=64, tx_array_shape=(8, 8), rx_array_shape=(1, 1))
+    synthesizer = MIMOOFDMSynthesizer(system)
+    shifted = {key: value.clone() for key, value in base.items()}
+    shifted["path_delays_ns"] += 250.0
+    shifted_csi = synthesizer(
+        shifted["path_delays_ns"],
+        shifted["path_powers_linear"],
+        shifted["path_phases_rad"],
+        shifted["aoa_az_deg"],
+        shifted["aoa_el_deg"],
+        shifted["aod_az_deg"],
+        shifted["aod_el_deg"],
+        shifted["path_mask"],
+    )
+    base_aligned = diagnostic._remove_common_delay_phase(
+        base["csi"], diagnostic._first_path_delay_ns(base), synthesizer.subcarrier_offsets_hz
+    )
+    shifted_aligned = diagnostic._remove_common_delay_phase(
+        shifted_csi,
+        diagnostic._first_path_delay_ns(shifted),
+        synthesizer.subcarrier_offsets_hz,
+    )
+    assert torch.allclose(base_aligned, shifted_aligned, atol=2e-5, rtol=2e-5)
+
+
 def test_targeted_diagnostic_smoke(tmp_path, monkeypatch) -> None:
     reference = _payload()
     artifact = {
@@ -141,6 +183,32 @@ def test_targeted_diagnostic_smoke(tmp_path, monkeypatch) -> None:
     assert "16" not in report["frequency_and_tx_decomposition"]["frequency_per_lag_map_summary"]
     variants = report["counterfactual"]["models"]["current"]["variants"]
     assert "phase_only" in variants
+    assert "delay_only" in variants
+    assert "delay_offset_only" in variants
+    assert "delay_relative_only" in variants
+    assert "delay_full" in variants
+    assert "delay_power_joint" in variants
+    assert "delay_power_phase_joint" in variants
     assert "delay_phase_joint" in variants
     assert "aod_global_orientation_only" in variants
     assert "aod_relative_structure_only" in variants
+    assert "aod_global_then_relative" in variants
+    assert (
+        variants["aod_global_orientation_only"]["relative_angle_change_vs_control"]
+        ["pairwise_spherical_separation_mae_deg"]
+        < 1e-3
+    )
+    comparisons = report["counterfactual"]["models"]["current"]["paired_map_comparisons"]
+    assert "E1_delay_only_vs_E0_control" in comparisons
+    assert "D1_offset_only_vs_D0_control" in comparisons
+    assert "D2_relative_only_vs_D0_control" in comparisons
+    assert "D3_full_delay_vs_D0_control" in comparisons
+    assert "E2_delay_power_vs_E1_delay_only" in comparisons
+    assert "E3_delay_power_phase_vs_E2_delay_power" in comparisons
+    assert "S2_global_then_relative_vs_S1_global" in comparisons
+    assert "frequency_delay_shift_invariant_relative_l2" in comparisons[
+        "D1_offset_only_vs_D0_control"
+    ]
+    assert "frequency_by_lag_delay_shift_invariant" in comparisons[
+        "D2_relative_only_vs_D0_control"
+    ]

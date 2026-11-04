@@ -20,6 +20,9 @@ from physics_csi.models.scene_delay_power_residual import SceneConditionedDelayP
 from physics_csi.models.scene_link_global_aod_residual import (
     SceneConditionedLinkGlobalAoDResidual,
 )
+from physics_csi.models.scene_relative_aod_residual import (
+    SceneConditionedRelativeAoDResidual,
+)
 from physics_csi.physics.synthesizer import MIMOOFDMSynthesizer, SystemConfig
 from physics_csi.training.aod_residual import AoDDistributionLoss, AoDLossWeights
 from physics_csi.training.trainer import move_to_device, resolve_device
@@ -92,6 +95,8 @@ def _load_aod(checkpoint: Mapping[str, Any], device: torch.device) -> torch.nn.M
         model_class = SceneConditionedAoDResidual
     elif model_kind == "scene_link_global_aod_residual":
         model_class = SceneConditionedLinkGlobalAoDResidual
+    elif model_kind == "scene_relative_aod_residual":
+        model_class = SceneConditionedRelativeAoDResidual
     else:
         raise ValueError("checkpoint is not a supported AoD residual")
     model = model_class(**checkpoint["model_init"]).to(device)
@@ -108,6 +113,21 @@ def _quantile_audit(values: torch.Tensor) -> dict[str, float]:
         "p99": float(torch.quantile(values, 0.99)),
         "maximum": float(values.max()),
     }
+
+
+def _power_weighted_direction_center(payload: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    mask = payload["path_mask"].bool()
+    power = payload["path_powers_linear"].float().clamp_min(0.0) * mask
+    fraction = power / power.sum(-1, keepdim=True).clamp_min(1e-20)
+    azimuth = torch.deg2rad(payload["aod_az_deg"].float())
+    elevation = torch.deg2rad(payload["aod_el_deg"].float())
+    horizontal = elevation.cos()
+    direction = torch.stack(
+        [horizontal * azimuth.cos(), horizontal * azimuth.sin(), elevation.sin()],
+        dim=-1,
+    )
+    center = (fraction.unsqueeze(-1) * direction).sum(1)
+    return center / center.norm(dim=-1, keepdim=True).clamp_min(1e-20)
 
 
 def main() -> None:
@@ -133,6 +153,7 @@ def main() -> None:
     if checkpoint.get("model_kind") not in {
         "scene_aod_residual",
         "scene_link_global_aod_residual",
+        "scene_relative_aod_residual",
     }:
         raise ValueError("checkpoint is not a supported AoD residual")
     if dp_checkpoint.get("model_kind") != "scene_delay_power_residual":
@@ -162,6 +183,23 @@ def main() -> None:
     model = _load_aod(checkpoint, device)
     if model.map_id_to_index != dp_model.map_id_to_index:
         raise ValueError("AoD and DP checkpoints use different Map mappings")
+    link_model: SceneConditionedLinkGlobalAoDResidual | None = None
+    if checkpoint.get("model_kind") == "scene_relative_aod_residual":
+        link_path = checkpoint.get("parent_link_global_checkpoint")
+        if not link_path:
+            raise ValueError("Relative-AoD checkpoint has no Link-global parent")
+        link_checkpoint = torch.load(link_path, map_location="cpu", weights_only=False)
+        if link_checkpoint.get("model_kind") != "scene_link_global_aod_residual":
+            raise ValueError("Relative-AoD parent is not a Link-global checkpoint")
+        link_model = SceneConditionedLinkGlobalAoDResidual(
+            **link_checkpoint["model_init"]
+        ).to(device)
+        link_model.load_state_dict(
+            link_checkpoint.get("ema_state_dict", link_checkpoint["model_state_dict"])
+        )
+        link_model.requires_grad_(False).eval()
+        if link_model.map_id_to_index != model.map_id_to_index:
+            raise ValueError("Relative and Link-global checkpoints use different Map mappings")
     loss_init = dict(checkpoint["loss_init"])
     weights = AoDLossWeights(**loss_init.pop("weights"))
     loss_function = AoDDistributionLoss(**loss_init, weights=weights).to(device).eval()
@@ -173,12 +211,14 @@ def main() -> None:
         "reference",
         "physics_only_baseline",
         "dp_only",
+        "link_global_only",
         "correct_map",
         "shuffled_map",
     )
     chunks: dict[str, dict[str, list[torch.Tensor]]] = {label: {} for label in labels}
     azimuth_residuals: list[torch.Tensor] = []
     elevation_residuals: list[torch.Tensor] = []
+    global_center_errors_deg: list[torch.Tensor] = []
     wrong_map_ids: list[torch.Tensor] = []
     dp_preservation_maximum = {
         "path_delays_ns": 0.0,
@@ -198,17 +238,28 @@ def main() -> None:
             wrong_index = _different_map_indices(correct_index, len(model.map_id_to_index))
             dp_output = dp_model(base, conditions, validity, map_index=correct_index)
             dp_payload = dp_model.apply_to_payload(base, dp_output)
-            correct_output = model(dp_payload, conditions, validity, map_index=correct_index)
-            shuffled_output = model(dp_payload, conditions, validity, map_index=wrong_index)
-            correct = model.apply_to_payload(dp_payload, correct_output)
-            shuffled = model.apply_to_payload(dp_payload, shuffled_output)
+            if link_model is not None:
+                link_output = link_model(
+                    dp_payload, conditions, validity, map_index=correct_index
+                )
+                aod_base = link_model.apply_to_payload(dp_payload, link_output)
+            else:
+                aod_base = dp_payload
+            correct_output = model(
+                aod_base, conditions, validity, map_index=correct_index
+            )
+            shuffled_output = model(
+                aod_base, conditions, validity, map_index=wrong_index
+            )
+            correct = model.apply_to_payload(aod_base, correct_output)
+            shuffled = model.apply_to_payload(aod_base, shuffled_output)
             for key in dp_preservation_maximum:
                 dp_preservation_maximum[key] = max(
                     dp_preservation_maximum[key],
                     float((correct[key] - dp_payload[key]).abs().max()),
                     float((shuffled[key] - dp_payload[key]).abs().max()),
                 )
-            for payload in (base, dp_payload, correct, shuffled):
+            for payload in (base, dp_payload, aod_base, correct, shuffled):
                 payload["map_id"] = reference["map_id"]
                 payload["csi"] = _synthesize(payload, synthesizer)
             reference["csi"] = _synthesize(reference, synthesizer)
@@ -216,11 +267,22 @@ def main() -> None:
             shuffled_external = model.external_map_ids(wrong_index)
             shuffled["conditioned_map_id"] = shuffled_external
             wrong_map_ids.append(shuffled_external.cpu())
-            for label, payload in zip(labels, (reference, base, dp_payload, correct, shuffled)):
+            for label, payload in zip(
+                labels, (reference, base, dp_payload, aod_base, correct, shuffled)
+            ):
                 _append(chunks[label], payload)
             active = dp_payload["path_mask"].bool()
             azimuth_residuals.append(correct_output.azimuth_residual_deg[active].cpu())
             elevation_residuals.append(correct_output.elevation_residual_deg[active].cpu())
+            before_center = _power_weighted_direction_center(aod_base)
+            after_center = _power_weighted_direction_center(correct)
+            global_center_errors_deg.append(
+                torch.rad2deg(
+                    torch.acos(
+                        (before_center * after_center).sum(-1).clamp(-1.0, 1.0)
+                    )
+                ).cpu()
+            )
 
     artifact = {label: _finish(chunks[label]) for label in labels}
     artifact.update(
@@ -234,8 +296,13 @@ def main() -> None:
             "checkpoint": str(Path(args.checkpoint).resolve()),
             "dp_checkpoint": str(Path(args.dp_checkpoint).resolve()),
             "cache": str(Path(args.cache).resolve()),
+            "system": checkpoint["system"],
             "shuffled_conditioned_map_id": torch.cat(wrong_map_ids),
-            "shuffled_scope": "AoD Map only; DP remains conditioned on the correct target Map.",
+            "shuffled_scope": (
+                "Relative-AoD Map only; DP and Link-global remain conditioned on the correct target Map."
+                if link_model is not None
+                else "AoD Map only; DP remains conditioned on the correct target Map."
+            ),
         }
     )
     artifact_path = Path(args.output_artifact)
@@ -250,6 +317,8 @@ def main() -> None:
         "delay_power_aod_swd",
         "link_power_aod_swd",
         "power_weighted_aod_swd",
+        "tx_spatial_correlation_relative_frobenius",
+        "tx_near_spatial_correlation_relative_l2",
         "distribution_score",
     )
     maps = sorted(int(value) for value in torch.unique(artifact["reference"]["map_id"]))
@@ -267,7 +336,13 @@ def main() -> None:
                 continue
             reference = move_to_device(_subset(artifact["reference"], map_indices), device)
             models: dict[str, Any] = {}
-            for label in ("physics_only_baseline", "dp_only", "correct_map", "shuffled_map"):
+            for label in (
+                "physics_only_baseline",
+                "dp_only",
+                "link_global_only",
+                "correct_map",
+                "shuffled_map",
+            ):
                 candidate = move_to_device(_subset(artifact[label], map_indices), device)
                 terms = loss_function.distribution_terms(candidate, reference)
                 models[label] = {key: float(value) for key, value in terms.items()}
@@ -283,7 +358,7 @@ def main() -> None:
         raise RuntimeError("no Map has enough AoD evaluation samples")
     summaries: dict[str, Any] = {}
     for comparison_number, comparison in enumerate(
-        ("dp_only", "shuffled_map", "physics_only_baseline")
+        ("link_global_only", "dp_only", "shuffled_map", "physics_only_baseline")
     ):
         section: dict[str, Any] = {}
         for metric_number, metric in enumerate(metric_names):
@@ -315,12 +390,24 @@ def main() -> None:
             "elevation_residual_deg": _quantile_audit(elevation),
             "azimuth_gate": float(torch.sigmoid(model.azimuth_gate_logit)),
             "elevation_gate": float(torch.sigmoid(model.elevation_gate_logit)),
+            "power_weighted_global_center_error_deg": _quantile_audit(
+                torch.cat(global_center_errors_deg)
+            ),
         },
         "dp_preservation_maximum_absolute_error": dp_preservation_maximum,
         "success_rule": (
-            "Correct AoD Map must beat DP-only and shuffled-AoD Map on power-weighted and "
-            "link-level Power--AoD across Maps. Delay--Power is preserved exactly by architecture; "
-            "PDP and complex CSI remain external non-regression gates."
+            (
+                "Relative-AoD must beat frozen Link-global-only and shuffled-Relative Map on "
+                "near-neighbor Tx correlation, power-weighted and link-level Power--AoD across "
+                "Maps. Delay--Power and the Link-global input are preserved exactly by "
+                "architecture; PDP and complex CSI remain external non-regression gates."
+            )
+            if link_model is not None
+            else (
+                "Correct AoD Map must beat DP-only and shuffled-AoD Map on power-weighted and "
+                "link-level Power--AoD across Maps. Delay--Power is preserved exactly by "
+                "architecture; PDP and complex CSI remain external non-regression gates."
+            )
         ),
         "cautions": [
             "This report uses one B3 generation cache and one AoD training seed.",

@@ -27,8 +27,17 @@ def main() -> None:
     report = json.load(Path(args.report).open("r", encoding="utf-8"))
 
     def compact(section: dict[str, Any]) -> dict[str, Any]:
+        selected = SELECTED_METRICS + tuple(
+            sorted(key for key in section if key.startswith("tx_spacing_"))
+        )
         return {
             metric: {
+                "candidate_mean_distance": section[metric].get(
+                    "correct_map_mean_distance"
+                ),
+                "comparison_mean_distance": section[metric].get(
+                    "comparison_mean_distance"
+                ),
                 "relative_mean_improvement": section[metric].get(
                     "relative_mean_improvement"
                 ),
@@ -47,7 +56,7 @@ def main() -> None:
                     "passes_noninferiority_gate"
                 ],
             }
-            for metric in SELECTED_METRICS
+            for metric in selected
         }
 
     output = {

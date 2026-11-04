@@ -1,0 +1,53 @@
+aod_architecture: relative_cluster
+
+relative_aod_residual:
+  hidden_dim: 96
+  map_embedding_dim: 24
+  condition_hidden_dim: 48
+  dropout: 0.05
+  maximum_log_scale: 0.45
+  initial_gate: 0.10
+  # Normalization bounds for the residual-strength regularizer only.
+  maximum_azimuth_residual_deg: 20.0
+  maximum_elevation_residual_deg: 10.0
+
+distribution_loss:
+  projections: 64
+  weighted_quantiles: 128
+  margin: 0.01
+  diversity_minimum_ratio: 0.90
+  weights:
+    path_power_aod: 0.25
+    delay_power_aod: 0.50
+    link_power_aod: 1.00
+    power_weighted_aod: 2.00
+    tx_spatial_correlation: 2.50
+    shuffled_margin: 0.50
+    residual_strength: 0.05
+    diversity: 0.10
+
+train:
+  seed: 2026
+  device: auto
+  epochs: 60
+  batch_size: 32
+  minimum_batch_size: 12
+  train_batches_per_epoch: 600
+  validation_batches_per_epoch: 160
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  mixed_precision: false
+  ema_decay: 0.995
+  patience: 12
+  lr_patience: 4
+  lr_reduce_factor: 0.5
+  checkpoint_dir: artifacts/checkpoints/aod_relative_cluster_residual
+  log_every_steps: 25
+
+evaluation:
+  split: test
+  maximum_samples_per_map: 64
+  minimum_samples_per_map: 12
+  bootstrap_samples: 10000
+  batch_size: 256

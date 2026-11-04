@@ -60,12 +60,39 @@ def main() -> None:
             "variants": {
                 name: {
                     "frequency_relative_l2": value["metrics"]["frequency_vector"]["relative_l2"],
+                    "frequency_delay_shift_invariant_relative_l2": value["metrics"][
+                        "frequency_vector_delay_shift_invariant"
+                    ]["relative_l2"],
                     "tx_relative_l2": value["metrics"]["tx_matrix"]["relative_l2"],
                     "gain_control_minus_variant": value["gain_control_minus_variant"],
                     **({"projection_audit": value["projection_audit"]} if "projection_audit" in value else {}),
                     **({"relative_angle_change_vs_control": value["relative_angle_change_vs_control"]} if "relative_angle_change_vs_control" in value else {}),
                 }
                 for name, value in suite["variants"].items()
+            },
+            "paired_map_comparisons": {
+                name: {
+                    "frequency_relative_l2": _compact_comparison(
+                        value["frequency_relative_l2"]
+                    ),
+                    "frequency_delay_shift_invariant_relative_l2": _compact_comparison(
+                        value["frequency_delay_shift_invariant_relative_l2"]
+                    ),
+                    "tx_relative_l2": _compact_comparison(
+                        value["tx_relative_l2"]
+                    ),
+                    "frequency_by_lag": {
+                        lag: _compact_comparison(lag_value)
+                        for lag, lag_value in value["frequency_by_lag"].items()
+                    },
+                    "frequency_by_lag_delay_shift_invariant": {
+                        lag: _compact_comparison(lag_value)
+                        for lag, lag_value in value[
+                            "frequency_by_lag_delay_shift_invariant"
+                        ].items()
+                    },
+                }
+                for name, value in suite["paired_map_comparisons"].items()
             },
         }
     output = {
@@ -78,6 +105,9 @@ def main() -> None:
         "counterfactual_selection_audit": report["counterfactual_selection_audit"],
         "counterfactual_real_vs_real_floor": {
             "frequency_relative_l2": report["counterfactual"]["real_vs_real_floor"]["frequency_vector"]["relative_l2"],
+            "frequency_delay_shift_invariant_relative_l2": report["counterfactual"][
+                "real_vs_real_floor"
+            ]["frequency_vector_delay_shift_invariant"]["relative_l2"],
             "tx_relative_l2": report["counterfactual"]["real_vs_real_floor"]["tx_matrix"]["relative_l2"],
         },
         "counterfactual": counterfactual,

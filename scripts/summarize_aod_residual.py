@@ -16,6 +16,8 @@ def main() -> None:
     def compact(section: dict[str, Any]) -> dict[str, Any]:
         return {
             metric: {
+                "candidate_mean_distance": value.get("correct_map_mean_distance"),
+                "comparison_mean_distance": value.get("comparison_mean_distance"),
                 "relative_mean_improvement": value.get("relative_mean_improvement"),
                 "bootstrap_95_percent_ci": value.get("bootstrap_95_percent_ci"),
                 "win_rate_excluding_ties": value.get("win_rate_excluding_ties"),
@@ -29,6 +31,15 @@ def main() -> None:
         "samples": report["samples"],
         "maps_evaluated": report["maps_evaluated"],
         "correct_map_vs_dp_only": compact(report["summaries"]["correct_map_vs_dp_only"]),
+        **(
+            {
+                "correct_map_vs_link_global_only": compact(
+                    report["summaries"]["correct_map_vs_link_global_only"]
+                )
+            }
+            if "correct_map_vs_link_global_only" in report["summaries"]
+            else {}
+        ),
         "correct_map_vs_shuffled_aod_map": compact(
             report["summaries"]["correct_map_vs_shuffled_map"]
         ),

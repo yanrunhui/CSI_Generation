@@ -13,6 +13,7 @@ from physics_csi.evaluation.research_diagnostics import (
     power_aod_joint_features,
 )
 from physics_csi.models.scene_aod_residual import AoDResidualOutput
+from physics_csi.physics.arrays import array_positions_wavelengths, array_response
 
 
 def _fixed_directions(dimensions: int, projections: int, seed: int) -> torch.Tensor:
@@ -58,6 +59,7 @@ class AoDLossWeights:
     shuffled_margin: float = 0.5
     residual_strength: float = 0.02
     diversity: float = 0.10
+    tx_spatial_correlation: float = 0.0
 
 
 class AoDDistributionLoss(nn.Module):
@@ -75,6 +77,9 @@ class AoDDistributionLoss(nn.Module):
         diversity_minimum_ratio: float = 0.85,
         maximum_azimuth_residual_deg: float = 20.0,
         maximum_elevation_residual_deg: float = 10.0,
+        tx_array_shape: tuple[int, int] = (8, 8),
+        tx_spacing_wavelengths: float = 0.5,
+        tx_array_plane: str = "xy",
         weights: AoDLossWeights | None = None,
         seed: int = 2026,
     ) -> None:
@@ -91,6 +96,17 @@ class AoDDistributionLoss(nn.Module):
         self.register_buffer("joint_directions", _fixed_directions(5, projections, seed + 1))
         self.register_buffer("link_directions", _fixed_directions(11, projections, seed + 2))
         self.register_buffer("weighted_directions", _fixed_directions(3, projections, seed + 3))
+        self.register_buffer(
+            "tx_positions",
+            array_positions_wavelengths(
+                tx_array_shape, tx_spacing_wavelengths, tx_array_plane
+            ),
+        )
+        separation = torch.cdist(self.tx_positions, self.tx_positions)
+        self.register_buffer(
+            "tx_near_pair_mask",
+            (separation > 0) & (separation <= 1.0 + 1e-6),
+        )
         self.register_buffer(
             "quantiles", (torch.arange(weighted_quantiles, dtype=torch.float32) + 0.5) / weighted_quantiles
         )
@@ -130,6 +146,22 @@ class AoDDistributionLoss(nn.Module):
             [delay_shape.unsqueeze(-1), normalized_power.unsqueeze(-1), direction], dim=-1
         )[mask]
 
+    def _tx_spatial_correlation(
+        self, payload: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        fraction = normalized_path_power(payload)
+        response = array_response(
+            payload["aod_az_deg"],
+            payload["aod_el_deg"],
+            self.tx_positions,
+            normalize=True,
+        )
+        correlation = torch.einsum(
+            "bl,blt,blu->tu", fraction, response, response.conj()
+        ) / max(response.shape[0], 1)
+        diagonal = correlation.diagonal().real.mean().clamp_min(1e-12)
+        return correlation / diagonal
+
     def distribution_terms(
         self,
         candidate: Mapping[str, torch.Tensor],
@@ -157,17 +189,29 @@ class AoDDistributionLoss(nn.Module):
             reference_points @ directions.T, reference_weights, quantiles
         )
         weighted_swd = (candidate_quantiles - reference_quantiles).abs().mean()
+        candidate_tx = self._tx_spatial_correlation(candidate)
+        reference_tx = self._tx_spatial_correlation(reference)
+        tx_spatial = torch.linalg.matrix_norm(candidate_tx - reference_tx) / (
+            torch.linalg.matrix_norm(reference_tx).clamp_min(1e-12)
+        )
+        near = self.tx_near_pair_mask
+        tx_near_spatial = torch.linalg.vector_norm(
+            (candidate_tx - reference_tx)[near]
+        ) / torch.linalg.vector_norm(reference_tx[near]).clamp_min(1e-12)
         score = (
             self.weights.path_power_aod * path_swd
             + self.weights.delay_power_aod * joint_swd
             + self.weights.link_power_aod * link_swd
             + self.weights.power_weighted_aod * weighted_swd
+            + self.weights.tx_spatial_correlation * tx_near_spatial
         )
         return {
             "path_power_aod_swd": path_swd,
             "delay_power_aod_swd": joint_swd,
             "link_power_aod_swd": link_swd,
             "power_weighted_aod_swd": weighted_swd,
+            "tx_spatial_correlation_relative_frobenius": tx_spatial,
+            "tx_near_spatial_correlation_relative_l2": tx_near_spatial,
             "distribution_score": score,
         }
 

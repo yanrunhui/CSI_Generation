@@ -28,6 +28,9 @@ from physics_csi.models.scene_delay_power_residual import SceneConditionedDelayP
 from physics_csi.models.scene_link_global_aod_residual import (
     SceneConditionedLinkGlobalAoDResidual,
 )
+from physics_csi.models.scene_relative_aod_residual import (
+    SceneConditionedRelativeAoDResidual,
+)
 from physics_csi.training.aod_residual import AoDDistributionLoss, AoDLossWeights
 from physics_csi.training.trainer import move_to_device, resolve_device
 from physics_csi.utils.io import atomic_json_dump
@@ -71,6 +74,12 @@ def _architecture(config: Mapping[str, Any]) -> tuple[str, str, type[torch.nn.Mo
             "link_global_aod_residual",
             SceneConditionedLinkGlobalAoDResidual,
         )
+    if name == "relative_cluster":
+        return (
+            "scene_relative_aod_residual",
+            "relative_aod_residual",
+            SceneConditionedRelativeAoDResidual,
+        )
     raise ValueError(f"unsupported AoD residual architecture: {name!r}")
 
 
@@ -95,6 +104,7 @@ def _make_loss(cache: Mapping[str, Any], config: Mapping[str, Any]) -> AoDDistri
     weights = AoDLossWeights(**values.pop("weights"))
     stats = cache["b3_statistics"]["multipath"]
     residual = _residual_config(config)
+    system = cache["system"]
     azimuth_normalization = float(
         values.pop(
             "residual_normalization_azimuth_deg",
@@ -113,6 +123,9 @@ def _make_loss(cache: Mapping[str, Any], config: Mapping[str, Any]) -> AoDDistri
         power_db_std=float(stats["log_power_fraction_db_std"]),
         maximum_azimuth_residual_deg=azimuth_normalization,
         maximum_elevation_residual_deg=elevation_normalization,
+        tx_array_shape=tuple(system["tx_array_shape"]),
+        tx_spacing_wavelengths=float(system["tx_spacing_wavelengths"]),
+        tx_array_plane=str(system.get("tx_array_plane", "xy")),
         weights=weights,
         seed=int(config["train"]["seed"]),
         **values,
@@ -132,6 +145,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train conditional per-path AoD residual.")
     parser.add_argument("--cache", required=True)
     parser.add_argument("--dp-checkpoint", required=True)
+    parser.add_argument(
+        "--link-global-checkpoint",
+        default=None,
+        help="Frozen Link-global parent; required for relative_cluster architecture.",
+    )
     parser.add_argument("--config", default="configs/aod_residual.yaml")
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--resume", default=None)
@@ -153,6 +171,31 @@ def main() -> None:
     if cache["b3_checkpoint_sha256"] != dp_checkpoint["cache_contract"]["b3_checkpoint_sha256"]:
         raise ValueError("cache and DP checkpoint use different frozen B3 backbones")
     dp_model = _load_frozen_dp(dp_checkpoint, device)
+    link_model: SceneConditionedLinkGlobalAoDResidual | None = None
+    link_checkpoint: Mapping[str, Any] | None = None
+    if str(config.get("aod_architecture", "per_path")) == "relative_cluster":
+        if not args.link_global_checkpoint:
+            raise ValueError(
+                "--link-global-checkpoint is required for relative_cluster training"
+            )
+        link_checkpoint = torch.load(
+            args.link_global_checkpoint, map_location="cpu", weights_only=False
+        )
+        if link_checkpoint.get("model_kind") != "scene_link_global_aod_residual":
+            raise ValueError("--link-global-checkpoint is not a Link-global AoD model")
+        for key, expected in (
+            ("scene_plan_fingerprint", cache["scene_plan_fingerprint"]),
+            ("b3_checkpoint_sha256", cache["b3_checkpoint_sha256"]),
+        ):
+            if link_checkpoint["cache_contract"][key] != expected:
+                raise ValueError(f"Link-global checkpoint has a different {key}")
+        link_model = SceneConditionedLinkGlobalAoDResidual(
+            **link_checkpoint["model_init"]
+        ).to(device)
+        link_model.load_state_dict(
+            link_checkpoint.get("ema_state_dict", link_checkpoint["model_state_dict"])
+        )
+        link_model.requires_grad_(False).eval()
 
     train_dataset = DelayPowerResidualCacheDataset(cache, "train")
     validation_dataset = DelayPowerResidualCacheDataset(cache, "validation")
@@ -212,6 +255,8 @@ def main() -> None:
     model = _make_model(cache, config).to(device)
     if model.map_id_to_index != dp_model.map_id_to_index:
         raise ValueError("AoD and DP residuals use different Map index mappings")
+    if link_model is not None and model.map_id_to_index != link_model.map_id_to_index:
+        raise ValueError("Relative and Link-global AoD models use different Map mappings")
     loss_function = _make_loss(cache, config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -252,6 +297,8 @@ def main() -> None:
         active = model if training else ema.model
         active.train(training)
         dp_model.eval()
+        if link_model is not None:
+            link_model.eval()
         totals: dict[str, float] = defaultdict(float)
         samples = 0
         context = torch.enable_grad if training else torch.no_grad
@@ -273,29 +320,92 @@ def main() -> None:
                         base, conditions, validity, map_index=correct_index
                     )
                     dp_payload = dp_model.apply_to_payload(base, dp_output)
+                    if link_model is not None:
+                        link_output = link_model(
+                            dp_payload,
+                            conditions,
+                            validity,
+                            map_index=correct_index,
+                        )
+                        aod_base_payload = link_model.apply_to_payload(
+                            dp_payload, link_output
+                        )
+                    else:
+                        aod_base_payload = dp_payload
                 if training:
                     optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(
                     device_type=device.type, dtype=torch.float16, enabled=use_amp
                 ):
                     correct_output = active(
-                        dp_payload, conditions, validity, map_index=correct_index
+                        aod_base_payload, conditions, validity, map_index=correct_index
                     )
                     shuffled_output = active(
-                        dp_payload, conditions, validity, map_index=wrong_index
+                        aod_base_payload, conditions, validity, map_index=wrong_index
                     )
-                    correct_payload = active.apply_to_payload(dp_payload, correct_output)
-                    shuffled_payload = active.apply_to_payload(dp_payload, shuffled_output)
+                    correct_payload = active.apply_to_payload(
+                        aod_base_payload, correct_output
+                    )
+                    shuffled_payload = active.apply_to_payload(
+                        aod_base_payload, shuffled_output
+                    )
                     metrics = loss_function(
                         correct_payload=correct_payload,
                         shuffled_payload=shuffled_payload,
-                        dp_payload=dp_payload,
+                        dp_payload=aod_base_payload,
                         reference_payload=reference,
                         correct_output=correct_output,
                     )
                 if training:
+                    if not torch.isfinite(metrics["loss"]):
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "aod_residual_nonfinite_loss",
+                                    "epoch": epoch,
+                                    "step": step,
+                                    "metrics": {
+                                        key: float(value.detach())
+                                        for key, value in metrics.items()
+                                    },
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                        raise FloatingPointError(
+                            "AoD residual produced a non-finite loss"
+                        )
                     scaler.scale(metrics["loss"]).backward()
                     scaler.unscale_(optimizer)
+                    nonfinite_parameters = [
+                        name
+                        for name, parameter in model.named_parameters()
+                        if parameter.grad is not None
+                        and not bool(torch.isfinite(parameter.grad).all())
+                    ]
+                    if nonfinite_parameters:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "aod_residual_nonfinite_gradient",
+                                    "epoch": epoch,
+                                    "step": step,
+                                    "global_step": global_step,
+                                    "parameters": nonfinite_parameters,
+                                    "metrics": {
+                                        key: float(value.detach())
+                                        for key, value in metrics.items()
+                                    },
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                        raise FloatingPointError(
+                            "AoD residual produced a non-finite gradient in: "
+                            + ", ".join(nonfinite_parameters)
+                        )
                     gradient_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), float(train.get("gradient_clip_norm", 1.0))
                     )
@@ -375,6 +485,11 @@ def main() -> None:
                         residual_config["maximum_elevation_residual_deg"],
                     )
                 ),
+                "tx_array_shape": tuple(cache["system"]["tx_array_shape"]),
+                "tx_spacing_wavelengths": float(
+                    cache["system"]["tx_spacing_wavelengths"]
+                ),
+                "tx_array_plane": str(cache["system"].get("tx_array_plane", "xy")),
                 "seed": int(train["seed"]),
                 **{
                     key: value
@@ -395,6 +510,14 @@ def main() -> None:
             },
             "dp_checkpoint": str(Path(args.dp_checkpoint).resolve()),
             "dp_checkpoint_epoch": int(dp_checkpoint["epoch"]),
+            "parent_link_global_checkpoint": (
+                str(Path(args.link_global_checkpoint).resolve())
+                if args.link_global_checkpoint
+                else None
+            ),
+            "parent_link_global_checkpoint_epoch": (
+                int(link_checkpoint["epoch"]) if link_checkpoint is not None else None
+            ),
             "system": cache["system"],
             "history": history,
             "torch_rng_state": torch.get_rng_state(),

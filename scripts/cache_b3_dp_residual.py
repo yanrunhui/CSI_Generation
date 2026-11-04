@@ -104,9 +104,22 @@ def main() -> None:
     parser.add_argument("--sampler", choices=["ddpm", "ddim"], default=None)
     parser.add_argument("--sampling-steps", type=int, default=None)
     parser.add_argument("--maximum-samples-per-split", type=int, default=None)
+    parser.add_argument(
+        "--splits",
+        default="train,validation,test",
+        help="Comma-separated cache splits. Defaults to all three splits.",
+    )
     args = parser.parse_args()
     if args.batch_size < 1 or args.num_workers < 0:
         parser.error("batch size must be positive and workers cannot be negative")
+    requested_splits = tuple(
+        value.strip() for value in args.splits.split(",") if value.strip()
+    )
+    allowed_splits = {"train", "validation", "test"}
+    if not requested_splits or len(set(requested_splits)) != len(requested_splits):
+        parser.error("--splits must contain one or more unique split names")
+    if set(requested_splits) - allowed_splits:
+        parser.error("--splits only supports train, validation and test")
 
     seed_everything(args.seed)
     device = resolve_device(args.device)
@@ -130,7 +143,7 @@ def main() -> None:
     cached_splits: dict[str, Any] = {}
     exclusion_audit: dict[str, Any] = {}
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    for split_number, split in enumerate(("train", "validation", "test")):
+    for split_number, split in enumerate(requested_splits):
         dataset = datasets[split]
         if args.maximum_samples_per_split is not None:
             maximum = min(len(dataset), args.maximum_samples_per_split)
@@ -239,6 +252,7 @@ def main() -> None:
             "eta": float(sampling.get("eta", 0.0)),
             "guidance_scale": float(sampling["guidance_scale"]),
             "seed": args.seed,
+            "splits": list(requested_splits),
             "forced_to_reference_path_count": True,
         },
         "physical_feasibility_exclusions": exclusion_audit,

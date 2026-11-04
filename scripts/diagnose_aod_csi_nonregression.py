@@ -240,7 +240,35 @@ def _projection_metrics(
     return sum(mmd_values) / len(mmd_values), sum(swd_values) / len(swd_values)
 
 
-def _spatial_metrics(candidate: torch.Tensor, reference: torch.Tensor) -> dict[str, float]:
+def _tx_near_spacing_groups(
+    system: Mapping[str, Any], device: torch.device
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    rows, columns = (int(value) for value in system["tx_array_shape"])
+    spacing = float(system["tx_spacing_wavelengths"])
+    row = torch.arange(rows, device=device).repeat_interleave(columns)
+    column = torch.arange(columns, device=device).repeat(rows)
+    first, second = torch.triu_indices(
+        rows * columns, rows * columns, offset=1, device=device
+    )
+    distance = (
+        (row[first] - row[second]).square()
+        + (column[first] - column[second]).square()
+    ).float().sqrt() * spacing
+    groups: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for target in (0.5, math.sqrt(0.5), 1.0):
+        selected = torch.isclose(
+            distance, torch.tensor(target, device=device), atol=1e-6, rtol=0.0
+        )
+        if bool(selected.any()):
+            groups[f"{target:.6f}"] = (first[selected], second[selected])
+    return groups
+
+
+def _spatial_metrics(
+    candidate: torch.Tensor,
+    reference: torch.Tensor,
+    spacing_groups: Mapping[str, tuple[torch.Tensor, torch.Tensor]],
+) -> dict[str, float]:
     candidate_matrix = spatial_correlation_matrix(candidate)
     reference_matrix = spatial_correlation_matrix(reference)
     difference = candidate_matrix - reference_matrix
@@ -256,7 +284,7 @@ def _spatial_metrics(candidate: torch.Tensor, reference: torch.Tensor) -> dict[s
         if bool(valid_phase.any())
         else torch.zeros((), device=reference_matrix.device)
     )
-    return {
+    result = {
         "tx_spatial_correlation_relative_frobenius": float(
             torch.linalg.matrix_norm(difference)
             / torch.linalg.matrix_norm(reference_matrix).clamp_min(1e-20)
@@ -266,6 +294,14 @@ def _spatial_metrics(candidate: torch.Tensor, reference: torch.Tensor) -> dict[s
         ),
         "tx_spatial_correlation_phase_mae_rad": float(phase_error),
     }
+    for distance, (first, second) in spacing_groups.items():
+        candidate_values = candidate_matrix[first, second]
+        reference_values = reference_matrix[first, second]
+        result[f"tx_spacing_{distance}_relative_l2"] = float(
+            torch.linalg.vector_norm(candidate_values - reference_values)
+            / torch.linalg.vector_norm(reference_values).clamp_min(1e-20)
+        )
+    return result
 
 
 def _annotate_noninferiority(
@@ -325,6 +361,11 @@ def main() -> None:
         args.candidate_artifact, map_location="cpu", weights_only=False
     )
     _validate_artifact(candidate_source)
+    system = candidate_source.get(
+        "system",
+        {"tx_array_shape": [8, 8], "tx_spacing_wavelengths": 0.5},
+    )
+    spacing_groups = _tx_near_spacing_groups(system, device)
     reference = candidate_source["reference"]
     model_csi: dict[str, torch.Tensor] = {
         args.candidate_label: candidate_source["correct_map"]["csi"],
@@ -427,7 +468,9 @@ def main() -> None:
                 "phase_invariant_full_csi_projected_mmd_rbf": invariant_mmd,
                 "phase_invariant_full_csi_projected_sliced_wasserstein": invariant_swd,
                 **_spatial_metrics(
-                    device_csi[label][indices], device_csi["reference"][indices]
+                    device_csi[label][indices],
+                    device_csi["reference"][indices],
+                    spacing_groups,
                 ),
             }
             models[label] = metrics
@@ -498,6 +541,7 @@ def main() -> None:
             "phase_probe_count": PHASE_PROBE_COUNT,
             "phase_probe_seed": PHASE_PROBE_SEED,
             "bootstrap_samples": args.bootstrap_samples,
+            "tx_spacing_groups_wavelengths": list(spacing_groups),
         },
         "normalization_audit": {
             "pdp": pdp_audit,
